@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    MegaMoEBf16Config,
+)
 
 
 @pytest.mark.gpu_4

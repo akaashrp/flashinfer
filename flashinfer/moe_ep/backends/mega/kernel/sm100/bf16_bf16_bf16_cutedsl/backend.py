@@ -57,7 +57,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # The drop's own shim bound (kernel_src/cutedsl_megamoe/shim/
+            # The drop's own shim bound (kernel_src/sm100/cutedsl_megamoe/shim/
             # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
             # SF-word 128 default. 32 covers hidden here; the stricter
             # intermediate bound is enforced below.
@@ -92,7 +92,9 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_bf16_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            get_symm_buffer_for_bf16_mega_moe,
+        )
 
         config = self._kernel_config
         return get_symm_buffer_for_bf16_mega_moe(
@@ -146,10 +148,10 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import bf16_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe
 
         if self._autotune_pending:
-            from ......kernel_src.cutedsl_megamoe import autotune_bf16_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
 
             autotune_bf16_mega_moe(
                 output,

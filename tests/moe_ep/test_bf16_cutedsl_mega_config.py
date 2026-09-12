@@ -7,11 +7,13 @@ import pytest
 from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.config import (
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    MegaMoEBf16Config,
+)
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
     bf16_candidates,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
     default_knobs,
     is_valid_bf16,
 )
