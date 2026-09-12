@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from ......core.validation.common import MoEEpConfigError
-
 
 def _data_dtype(kind: str) -> torch.dtype:
     return torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
@@ -75,56 +73,15 @@ def validate_sm107_forward_inputs(
     scales: torch.Tensor | None = None,
 ) -> None:
     """SM107 mega-path validation (bf16 staging or pre-staged mxfp8)."""
-    from ......core.validation.common import validate_mega_forward_inputs
+    from ..validation import validate_forward_metadata
 
-    if quantize_input:
-        validate_mega_forward_inputs(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            fleet_params,
-            top_k=top_k,
-            quantize_input=True,
-        )
-        return
-
-    from ......kernel_src.sm107.next_cutedsl_megamoe import Mxfp8BlockSize, ceil_div
-
-    num_tokens = hidden_states.shape[0]
-    hidden = fleet_params.token_hidden_size
-    if scales is None:
-        raise MoEEpConfigError(
-            "MoEEpTensors.scales is required when MegaConfig.quantize_input=False"
-        )
-    if num_tokens > fleet_params.max_tokens_per_rank:
-        raise MoEEpConfigError(
-            f"token count {num_tokens} exceeds "
-            f"max_tokens_per_rank={fleet_params.max_tokens_per_rank}"
-        )
-    if hidden_states.ndim != 2 or hidden_states.shape[1] != hidden:
-        raise MoEEpConfigError(
-            f"pre-staged MXFP8 hidden_states must be 2D with shape "
-            f"[num_tokens, {hidden}], got {tuple(hidden_states.shape)}"
-        )
-    if hidden_states.dtype != _data_dtype(kind):
-        raise MoEEpConfigError(
-            f"pre-staged MXFP8 hidden_states must have dtype {_data_dtype(kind)}, "
-            f"got {hidden_states.dtype}"
-        )
-    if topk_ids.shape != (num_tokens, top_k):
-        raise MoEEpConfigError(
-            f"topk_ids must have shape ({num_tokens}, {top_k}), "
-            f"got {tuple(topk_ids.shape)}"
-        )
-    if topk_weights.shape != topk_ids.shape:
-        raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
-    hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
-    if scales.ndim != 2 or scales.shape[0] != num_tokens:
-        raise MoEEpConfigError(
-            f"scales must be 2D with leading dim {num_tokens}, got {tuple(scales.shape)}"
-        )
-    if scales.shape[1] < hidden_sf_cols:
-        raise MoEEpConfigError(
-            f"scales.shape[1] ({scales.shape[1]}) must be >= {hidden_sf_cols} "
-            f"for hidden={hidden}"
-        )
+    validate_forward_metadata(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        fleet_params,
+        top_k=top_k,
+        quantize_input=quantize_input,
+        quant_kind=kind,
+        scales=scales,
+    )

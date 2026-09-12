@@ -24,6 +24,7 @@ from ......core.validation.common import (
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..validation import validate_routing_values, validate_unit_scalars
 from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
 from .weights import (
@@ -67,6 +68,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
+        from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
+
+        self._ensure_ep_bootstrap(bootstrap)
+        self._resolved_config(fleet_params)
+        if torch.cuda.is_available():
+            require_sm107_dsl()
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -100,54 +107,25 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
-    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        # Backend talks only to the next_cutedsl_megamoe shim (never src/
-        # directly).
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
-            get_symm_buffer_for_sm107_block_scaled_mega_moe,
+    def _resolved_config(self, fleet_params: FleetParams):
+        from ..validation import make_workspace_config
+
+        return make_workspace_config(
+            self._kernel_config,
+            fleet_params,
+            rank=self.ep_rank,
+            world_size=self.ep_world_size,
+            quant_kind=self._kernel_config.kind,
+            gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
+            overrides=self._knob_overrides(fleet_params),
         )
 
-        k = self._kernel_config
-        fp = fleet_params
-        # The tuning knobs the offline tuner sweeps; the config's `knobs`
-        # field (dict / "cache") overrides the explicit fields.
-        tuning: dict = {
-            "mma_tiler_mnk": k.mma_tiler_mnk,
-            "cluster_shape_mn": k.cluster_shape_mn,
-            "fallback_cluster_shape_mn": k.fallback_cluster_shape_mn,
-            "schedule_policy": k.schedule_policy,
-            "work_id_mode": k.work_id_mode,
-            "fc2_use_bulk": k.fc2_use_bulk,
-            "fc2_tma_stages": k.fc2_tma_stages,
-            "epi_flag_batches": k.epi_flag_batches,
-            "token_in_flag_batch": k.token_in_flag_batch,
-            "token_back_mode": k.token_back_mode,
-            "reduce_topk_in_kernel": k.in_kernel_fc2_reduce,
-        }
-        tuning.update(self._knob_overrides(fp))
-        # Unset optional keys fall back to the allocator defaults.
-        for key in (
-            "mma_tiler_mnk",
-            "cluster_shape_mn",
-            "fallback_cluster_shape_mn",
-            "fc2_tma_stages",
-        ):
-            if tuning[key] is None:
-                del tuning[key]
-        return get_symm_buffer_for_sm107_block_scaled_mega_moe(
-            fp.num_experts,
-            fp.max_tokens_per_rank,
-            k.top_k,
-            fp.token_hidden_size,
-            k.intermediate_size,
-            self.ep_rank,
-            self.ep_world_size,
-            quant_kind=k.kind,
-            gate_up_clamp=_resolve_gate_up_clamp(k),
-            apply_topk_at_fc1=k.apply_topk_in_fc1,
-            max_sm_count=k.max_sm_count,
-            **tuning,
+    def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
+        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+            Sm107BlockScaledSymmBuffer,
         )
+
+        return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve the config's ``knobs`` field into shim-kwarg overrides.
@@ -180,6 +158,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 num_experts=fleet_params.num_experts,
                 topk=k.top_k,
                 max_tokens=fleet_params.max_tokens_per_rank,
+                allow_nondeterministic=k.in_kernel_fc2_reduce,
+                apply_topk_at_fc1=k.apply_topk_in_fc1,
             )
             if self.ep_rank == 0:
                 print(
@@ -201,6 +181,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        validate_unit_scalars(t)
         validate_sm107_forward_inputs(
             t.hidden_states,
             t.topk_ids,
@@ -215,6 +196,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
+        validate_routing_values(
+            t.topk_ids, t.topk_weights, workspace.config.num_total_experts
+        )
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,

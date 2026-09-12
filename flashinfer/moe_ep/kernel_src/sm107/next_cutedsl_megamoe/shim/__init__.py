@@ -28,6 +28,8 @@ from .block_scaled import (
     sm107_block_scaled_mega_moe,
 )
 from .comm import ensure_not_capturing, free_sym_tensor, sym_zeros
+from .dependencies import require_sm107_dsl
+from .correctness import output_error, sampled_reference
 from .knob_cache import (
     default_knobs,
     knob_cache_path,
@@ -51,8 +53,11 @@ __all__ = [
     "is_valid_sm107",
     "knob_cache_path",
     "lookup_knobs",
+    "output_error",
     "record_knobs",
+    "require_sm107_dsl",
     "resolve_knobs",
+    "sampled_reference",
     "sm107_block_scaled_mega_launch_thunk",
     "sm107_block_scaled_mega_moe",
     "sm107_candidates",

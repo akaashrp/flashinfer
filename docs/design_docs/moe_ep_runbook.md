@@ -248,9 +248,26 @@ Rubin-only (`sm107_{mxfp8_mxfp8,nvfp4_nvfp4}_bf16_cutedsl`, the
 `next_cutedsl_megamoe` inference
 drop) targets, also in their own pytest processes:
 `bash tests/moe_ep/run_tests.sh oracle_sm107` (1 GPU, `MEGA_NO_DIST=1`) and
-`bash tests/moe_ep/run_tests.sh mega_sm107` (4 GPUs). Tests are gated on the
+`bash tests/moe_ep/run_tests.sh mega_sm107` (`NPROC_MULTIRANK=2`, `4`, or `8`,
+default 4). Both cover NVFP4, MXFP8 E4M3, and MXFP8 E5M2. Tests are gated on the
 `arch_rubin` marker (auto-skip unless compute capability == 10.7); the sm100
 `arch_blackwell` tests conversely auto-skip ON Rubin hosts.
+
+For merge qualification, use the stricter entry point:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
+  --output-dir /tmp/sm107-ep4
+```
+
+This rejects skips, OOMs, an empty test selection, incompatible compiler
+targets, and non-Rubin GPUs. It saves per-rank JUnit and process logs and
+terminates the whole job on timeout. See the [SM107 qualification
+runbook](moe_ep_sm107_qualification.md) for the EP2/4/8, sanitizer,
+benchmark, packaging, and upstream acceptance matrix.
+
+### Hopper performance benchmark
 
 The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
 token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:

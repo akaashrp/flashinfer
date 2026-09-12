@@ -8,7 +8,8 @@
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
-#   bash tests/moe_ep/run_tests.sh mega_sm107    # 4-GPU Rubin sm107 block-scaled (mxfp8 + nvfp4) mega multirank
+#   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
+#   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
@@ -130,6 +131,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm107_kernel_boundaries.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -321,9 +323,10 @@ for device in range(8):
 run_oracle_sm107() {
   # -s: the oracle tests print their rel_l2 / max|d| margins; keep them in the
   # log instead of pytest's capture buffer.
-  MEGA_NO_DIST=1 "${PY}" -m pytest \
+  MEGA_NO_DIST=1 CUTE_DSL_ARCH=sm_107a "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
+    tests/moe_ep/test_sm107_kernel_boundaries.py \
     -m arch_rubin
 }
 
@@ -342,10 +345,10 @@ run_mega_sm90() {
 # 4-GPU Rubin (SM107) block-scaled mega multirank (MoEEpLayer vs torch oracle
 # on real cross-rank EP traffic).  Own torchrun pytest process.
 run_mega_sm107() {
-  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+  CUTE_DSL_ARCH=sm_107a "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
-    -m "gpu_4 and arch_rubin"
+    -m "gpu_2 and arch_rubin"
 }
 
 # 2-GPU Hopper push-style FP8 (sm90_fp8_fp8_bf16_push_cuda) kernel + backend.
@@ -461,6 +464,7 @@ run_all() {
 # Single-target runs must still propagate failure (print_summary returns
 # non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
+  qualify_sm107) "${PY}" tests/moe_ep/qualify_sm107.py --suite all --world-size "${NPROC_MULTIRANK}" --output-dir "${SM107_RESULTS_DIR:-/tmp/flashinfer-sm107-qualification}" ;;
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
   oracle_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl torch-oracle correctness (1 Hopper GPU)" run_oracle_sm90; print_summary ;;
@@ -479,7 +483,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

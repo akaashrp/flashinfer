@@ -268,6 +268,8 @@ def pytest_runtest_call(item):
     try:
         yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if os.environ.get("FLASHINFER_STRICT_MOE_EP_TESTS") == "1":
+            raise
         if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):

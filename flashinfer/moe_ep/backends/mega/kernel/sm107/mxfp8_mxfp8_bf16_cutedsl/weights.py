@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Tuple
 
 from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ..validation import validate_weight_layout
 from ...weight_validation import (
     check_transformed_mega_weights_structure,
     check_transformed_weight_pair,
@@ -40,6 +41,8 @@ __all__ = [
 def _data_dtype(kind: Sm107Mxfp8Kind) -> "torch.dtype":
     import torch
 
+    if kind not in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        raise MoEEpConfigError(f"unsupported MXFP8 kind {kind!r}")
     return torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
 
 
@@ -55,8 +58,6 @@ def preprocess_mega_weights(
     Pre-quantized packs are not supported yet (the kernel-layout + swizzled-SF
     import path can be added when a producer exists).
     """
-    import torch
-
     if isinstance(weights, PrequantizedMoEWeights):
         raise MoEEpConfigError(
             "pre-quantized weights are not supported by the "
@@ -66,12 +67,12 @@ def preprocess_mega_weights(
 
     # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
-        interleave_gate_up_16,
-        quantize_mxfp8_block32,
-        to_blocked,
+        preprocess_block_scaled_weights,
     )
 
     w13, w2 = weights.w13, weights.w2
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise MoEEpConfigError("canonical w13 and w2 must both be 3D tensors")
     num_local_experts = w13.shape[0]
     fc1_out = 2 * intermediate_size
     if tuple(w13.shape) != (num_local_experts, fc1_out, hidden_size):
@@ -85,30 +86,10 @@ def preprocess_mega_weights(
             f"({num_local_experts}, {hidden_size}, {intermediate_size})"
         )
 
-    data_dtype = _data_dtype(kind)
-
-    # FC1: interleave the gate‖up halves into 16-row pair stripes, quantize
-    # along K (hidden, the trailing dim), then expose the kernel's logical
-    # (E, hidden, 2I) view with hidden stride-1.
-    w13_interleaved = interleave_gate_up_16(
-        w13.to(torch.float32), intermediate_size=intermediate_size
-    ).contiguous()
-    fc1_q, fc1_sf = quantize_mxfp8_block32(w13_interleaved, data_dtype)
-    fc1_weight = fc1_q.permute(0, 2, 1)
-    fc1_weight_sf = torch.stack(
-        [to_blocked(fc1_sf[e].view(torch.uint8)) for e in range(num_local_experts)]
-    ).view(torch.float8_e8m0fnu)
-
-    # FC2: quantize along K (intermediate, the trailing dim of canonical w2),
-    # then expose the logical (E, intermediate, hidden) view.
-    w2_f32 = w2.to(torch.float32).contiguous()
-    fc2_q, fc2_sf = quantize_mxfp8_block32(w2_f32, data_dtype)
-    fc2_weight = fc2_q.permute(0, 2, 1)
-    fc2_weight_sf = torch.stack(
-        [to_blocked(fc2_sf[e].view(torch.uint8)) for e in range(num_local_experts)]
-    ).view(torch.float8_e8m0fnu)
-
-    return ((fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf))
+    _data_dtype(kind)
+    return preprocess_block_scaled_weights(
+        w13, w2, quant_kind=kind, intermediate_size=intermediate_size
+    )
 
 
 def validate_transformed_mega_weights(
@@ -155,3 +136,5 @@ def validate_transformed_mega_weights(
             swizzled_flat_sf_size(hidden_size, intermediate_size // Mxfp8BlockSize),
         ),
     )
+    for weight, scale in transformed:
+        validate_weight_layout(weight, scale, scale_dtype=torch.float8_e8m0fnu)

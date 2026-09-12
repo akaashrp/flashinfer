@@ -1,123 +1,124 @@
-# SM107 (Rubin) block-scaled mega kernel — tuning notes
+# SM107 MegaMoE tuning and measurement
 
-Tuning surface, selected-best knob profiles, and benchmark methodology for
-the `sm107_nvfp4_nvfp4_bf16_cutedsl` / `sm107_mxfp8_mxfp8_bf16_cutedsl` mega
-backends. Concrete latency numbers are intentionally not recorded here —
-they are hardware/driver/DSL-build specific; reproduce them with the
-harness below on your own nodes.
+Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
+All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
+a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
+starts. The original PR's internal-build performance claims are not a
+baseline for this rebased implementation; rerun on the supported public
+compiler and retain absolute measurements.
 
-## Reference tuning (upstream kernel team)
+## What the benchmark measures
 
-The upstream kernel tester swept 384 candidates per problem at upstream
-commit `47881ad2` (2026-08-15; its `rubin/inference/mega` files are
-identical to the vendored `92dd334`) on a four-GPU Rubin node, for the
-**DSv4 Pro, EP4** problem — hidden 7168, MoE intermediate 3072, 384 total
-experts, top-k 6, NVFP4, BF16 combine.
+`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` reports:
 
-Every selected winner uses **mixed CGA (preferred 4x1, fallback 2x1),
-phase-interleave scheduling, atomic work IDs, FC2 bulk TMA stage 2,
-epi-warp token back, and separate top-k reduction**; only the tile,
-phase-interleave hint, epi flag batches, and token-in flag batch vary:
+- `--mode kernel`: a launch over already staged inputs, including the
+  required output/reset operations and dispatch, both GEMMs, and combine.
+- `--mode forward`: `MoEEpLayer.forward()`, including validation, Torch
+  quantization/staging, output allocation/copy, and the kernel.
+- `--execution eager|graph`: eager launches or replay of a warmed CUDA
+  graph. These are separate series, not interchangeable measurements.
 
-| Routing | Tokens/rank | Tile (MxNxK) | Hint | Epi flags (FC1xFC2) | Token-in flag batch |
-|---|---|---|---|---|---|
-| balanced | 1K | 256x128x256 | 4 | 1x4 | 1 |
-| balanced | 2K-4K | 256x256x256 | 3 | 2x4 | 1 |
-| balanced | 8K-32K | 256x256x256 | 3 | 1x4 | 1 |
-| power-law(0.8) | 1K | 256x128x256 | 3 | 1x4 | 1 |
-| power-law(0.8) | 2K | 256x256x256 | 3 | 1x4 | 1 |
-| power-law(0.8) | 4K | 256x256x256 | 4 | 1x4 | 1 |
-| power-law(0.8) | 8K | 256x256x256 | 3 | 1x4 | 1 |
-| power-law(0.8) | 16K-32K | 256x256x256 | 3 | 1x4 | 4 |
+CUDA events delimit the chosen span. The optional L2 flush runs outside
+each event window; `--no-l2-flush` measures consecutive launches without
+that separation. The primary statistic is the median of the maximum rank
+latency in each matched iteration, with p95 also reported. JSONL preserves
+every rank's samples, the per-iteration maxima, full resolved configuration,
+geometry, live/capacity counts, routing seed/load ratio, software versions,
+repository status, preprocessing time, PyTorch peak memory, and workspace
+sizes. PyTorch allocator peaks do not account for all external NVSHMEM heap
+allocations; inspect the workspace sizes and NVSHMEM heap configuration too.
 
-(NVFP4 tile K 256 = its 2x-mode instruction depth; for mxfp8 the analogous
-tile K is 128.) These profiles are baked into `default_knobs()` in the
-shim's `knob_cache.py` (two token buckets: tile N 128 below 2048
-tokens/rank, 256 at or above) and into the benchmark harness's per-size
-`WINNERS` table.
+Before accepting a result, the harness compares evenly spaced output rows,
+including the first and last, to a collective Torch oracle using the actual
+quantized bytes. It also checks the entire output for nonfinite values.
+The 64-row sample is a benchmark guard, not a replacement for full small
+problem correctness tests or sanitizer coverage.
 
-## Benchmark harness / methodology
+The default geometry is H=7168, I=3072, E=384, top-k=6. Override it with
+`--hidden`, `--intermediate`, `--num-experts`, and `--topk`. `--tokens`
+controls live rows; `--capacity` fixes a larger workspace capacity.
+`--seed` controls weight and routing generation. `--quant-kind all`
+selects all three formats; `both` retains NVFP4 plus E4M3.
 
-`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` under
-`torchrun --nproc_per_node=4`. The selected-best knobs above are replayed
-verbatim (no autotune sweep — one config per problem). Timing spans ONLY
-the fused mega kernel launch (dispatch + FC1 + SwiGLU + FC2 + combine) via
-`sm107_block_scaled_mega_launch_thunk` over pre-staged inputs; the torch
-staging fallback is excluded, matching the upstream tester's span.
+## Knob policies
 
-The timed loop replicates the upstream tester's perf run exactly: 5 warmup
-+ 20 measured iterations, per-iteration CUDA event pairs, and a
-per-iteration L2 flush (a 300MB throwaway ``randn`` enqueued outside the
-event window; ``--no-l2-flush`` disables it). Reported latency is the mean
-of the rank averages; min-max spans every rank sample; TFLOP/s =
-tokens x topk x 6 x hidden x intermediate / latency (balanced routing
-only — the balanced cost model is not meaningful for imbalanced cases).
-Raw per-rank samples are written as JSONL (``--output``).
+`--knobs default` uses the public backend defaults (also the benchmark
+default). `heuristic` selects `default_knobs()`; `cache` resolves a
+previously qualified local winner; a JSON object supplies explicit shim
+knobs. `reported` replays the profile table carried by PR #4601, restricted
+to its EP4/H7168/I3072/E384/K6 geometry and listed token counts. Those
+profiles came from NVFP4; their MXFP8 adaptation is a candidate, not a
+measured MXFP8 optimum.
 
-Routing generators are ports of the upstream tester's block-balanced and
-Zipf/Gumbel power-law samplers.
+Engine configuration has the same distinction: `knobs=None` preserves
+explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
+and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
 
-## Measured results (qualitative summary)
+## Required benchmark matrix
 
-Measured 2026-08-18 on a 4x SM107 node (vendored drop `92dd334`,
-NVIDIA-internal CuTe DSL nightly of 2026-08-03, git `d88cc85`):
+On the same idle node and pinned environment, measure EP2, EP4, and EP8 where
+claimed; T=1, 16, 128, 512, 1024, 2048, 4096, 8192, 16384, and 32768;
+all formats; balanced and power-law routing; default and tuned knobs;
+kernel and full-forward spans; eager and graph execution. Include small
+live batches in a 32768-row capacity. Use at least five routing seeds for
+imbalanced cases and save each run independently. Report p50/p95 absolute
+latency and memory; establish acceptable regression margins with maintainers
+before selecting results.
 
-- **NVFP4 matches the upstream reference within ~2% in the compute-bound
-  regime** (>= 8K tokens/rank), validating the port end to end. At smaller
-  token counts our node measured faster than the reference under the
-  identical protocol; the gap decays to ~0 by 8K — the profile of a fixed
-  latency/bandwidth term (small sizes are dispatch/NVLink latency-bound),
-  i.e. a measurement-environment difference, not a kernel difference.
-- **MXFP8 runs at roughly 1.3-1.5x the NVFP4 latency** at equal token
-  counts — consistent with the doubled operand bytes through both GEMMs —
-  and its knobs simply replay the NVFP4 winners (tile K 128); a dedicated
-  mxfp8 tuner sweep may claw some of this back.
-- **Power-law comparisons carry +/-10-20% routing-draw noise**: the Zipf
-  popularity permutation is seed-dependent, and the hottest expert/rank
-  gates the whole collective. Treat imbalanced-routing comparisons as
-  directional only.
-
-## Tuner
-
-The SM107 backends are wired into the moe_ep offline knob tuner (same shape
-as the SM100 one):
+For example, run both commands for each `mode`, policy, and execution mode:
 
 ```bash
-torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
-    --arch sm107 --dtype nvfp4 --hidden 7168 --intermediate 3072 \
-    --num-experts 384 --topk 6 --max-tokens 1024 8192 32768
+export CUTE_DSL_ARCH=sm_107a
+torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+  --quant-kind all --routing both --tokens 1,16,128,512,1024,2048,4096,8192,16384,32768 \
+  --mode kernel --execution eager --knobs default --iters 50 \
+  --output /tmp/sm107-ep4-default-kernel.jsonl
+torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+  --quant-kind all --routing both --tokens 1,16,128,512,1024 --capacity 32768 \
+  --mode forward --execution graph --knobs cache --iters 50 \
+  --output /tmp/sm107-ep4-cache-forward-graph.jsonl
 ```
 
-- Candidate space: `sm107_candidates()` in the shim's `autotune.py` — 16
-  candidates over tile N (128/256) x launch (uniform grouped vs mixed-CGA
-  phase-interleave/atomic) x epi flag batches ((1,4)/(2,4)) x FC2 bulk TMA
-  (off / 2-stage); `--allow-nondeterministic` adds the in-kernel-reduce
-  axis (32). `--sweep schedule` pins those and sweeps the skew-sensitive
-  hint x token-in-flag-batch grid (pair with `--skew`).
-- Each candidate REBUILDS the kernel session (SM107 bakes knobs at
-  construction — no `apply_knobs`), copies the staged inputs across, times
-  `timed_iters` synchronized launches, and destroys the trial session; the
-  winner is the argmin of the across-rank MAX medians.
-- Winners persist in the shared knob cache
-  (`FLASHINFER_MOE_EP_KNOB_CACHE`, default
-  `~/.cache/flashinfer/moe_ep_knob_cache.json`; entries keyed by device +
-  dtype + geometry + token bucket, so SM107 never collides with SM100).
-- Engine-side resolution via the config's `knobs` field: `None` (default)
-  keeps the explicit config fields; `"cache"` resolves the recorded winner
-  (falling back to the built-in heuristic = the reference selected-best
-  profile in `default_knobs()`); a dict overrides explicitly. The
-  SM100-style online `"auto"` sweep is deliberately NOT supported on the
-  engine path (rebuild-per-candidate inside a serving engine is worse than
-  the ~24-compile stall that motivated the offline cache in the first
-  place).
+These runs generate and transform weights before timing. The row-chunked
+preprocessor bounds scratch memory, and expert concatenation preserves
+K-major layout. Also measure a full canonical local weight bank when
+evaluating model-load memory; chunked synthetic generation alone does not
+represent retaining all canonical weights during conversion.
 
-## Notes
+Compare changes by running the same harness, geometry, seed, topology,
+clocks, software, and measurement mode at both revisions. The harness does
+not print ratios against old hard-coded internal latencies. Report the
+Torch staging cost explicitly before deciding whether fused staging is a
+merge requirement or a follow-up.
 
-- Vendored drop: upstream `92dd334` (see `VENDOR.md`). The mixed-CGA knob
-  is exposed as `fallback_cluster_shape_mn` on both backend configs; the
-  shim replicates the upstream `launch_cluster_configuration()` occupancy
-  recipe.
-- The backends stage activations with the torch quantization fallback; a
-  fused staging kernel is a known follow-up. End-to-end forward latency is
-  therefore staging-dominated for now — the benchmark isolates the mega
-  kernel to keep results comparable with the upstream tester.
+## Offline tuning
+
+Use a separate cache file for each qualification job to avoid concurrent
+writers. Start with the regular candidate grid; use a schedule sweep with
+production-like skew after correctness passes:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+export FLASHINFER_MOE_EP_KNOB_CACHE=/tmp/sm107-qualified-knobs.json
+timeout --kill-after=15s 3600s torchrun --standalone --nproc_per_node=4 \
+  -m flashinfer.moe_ep.tune --arch sm107 --dtype nvfp4 \
+  --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6 \
+  --max-tokens 1024 4096 32768 --warmup-iters 5 --timed-iters 30
+```
+
+The tuner verifies collective candidate agreement, rejects invalid geometry
+before symmetric allocation, checks sampled outputs against a Torch oracle,
+then measures isolated CUDA-event launches. It reduces each iteration with
+MAX across ranks before taking the median. Only a candidate passing the
+numerical checks can enter the cache. Runtime failures stop the job;
+relaunch in fresh workers instead of continuing on a failed CUDA context.
+
+The cache distinguishes the SM107 implementation revision, geometry,
+quantization, early/late routing weights, and nondeterminism permission.
+Legacy entries from the original PR are ignored. In-kernel reduction is
+excluded by default; `--allow-nondeterministic` opts it into tuning.
+Engine-side cache lookup requires `in_kernel_fc2_reduce=True` to permit
+such an entry, and early routing weights are mandatory for that mode.
+Record accuracy and replay variability for any selected nondeterministic
+configuration. Retune after changing the kernel, compiler, device
+partition, topology, or relevant runtime configuration.

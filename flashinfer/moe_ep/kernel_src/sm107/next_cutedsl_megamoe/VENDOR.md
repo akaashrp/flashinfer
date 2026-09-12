@@ -9,7 +9,7 @@ kernel-component model).
 ## Provenance
 
 - Upstream repo: the NVIDIA kernel team's `cutedsl_megamoe` repository
-  (internal; see `ACKNOWLEDGEMENT.md` for authors/contacts).
+  (internal; see the shared [acknowledgements](../../sm100/cutedsl_megamoe/ACKNOWLEDGEMENT.md) for authors/contacts).
 - Upstream commit: `92dd334` (2026-08-15; brings in `a5b4d33` "Rubin MegaMoE
   Perf Improvment" — the mixed-CGA preferred/fallback cluster launch,
   reworked FC12 scheduler, and the token-in size-copy reorder around the
@@ -17,13 +17,17 @@ kernel-component model).
   `rubin/inference/mega` files at `92dd334` are identical to upstream
   commit `47881ad2` (2026-08-15).
 - Copied subtree: `next/sources/` → `src/sources/`
-- DSL requirement: the kernels need `cutlass.utils.rubin_helpers`, which is
-  in NO public `nvidia-cutlass-dsl` release (<= 4.7.0; the 4.7.0 wheel
-  contains no Rubin files, and 4.8 had not shipped as of 2026-08-18).
-  Validated on an NVIDIA-internal CuTe DSL nightly build (2026-08-03, git
-  `d88cc85`); Rubin support in the public wheels is expected in the 4.8
-  line. When a Rubin-capable public release ships, re-run the
-  `oracle_sm107` / `mega_sm107` test targets against it.
+- DSL requirement: native `sm_107a` and `cutlass.utils.rubin_helpers`.
+  Public `nvidia-cutlass-dsl==4.8.0.dev0` provides these APIs; the general
+  FlashInfer DSL dependency floor does not. Install the `sm107` extra and
+  export `CUTE_DSL_ARCH=sm_107a` before importing FlashInfer. The shim
+  checks both compiler capabilities and the target captured at import.
+- Qualification provenance: PR #4601 reported execution on an internal
+  2026-08-03 DSL build (`d88cc85`). That evidence does not qualify the
+  rebased implementation or public compiler. The public 4.8.0.dev0 build
+  passed host kernel construction and portable Torch tests during the
+  integration audit; native Rubin execution remains required. See the
+  [qualification runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
 
 ## Scope of this drop (inference only)
 

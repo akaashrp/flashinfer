@@ -7,8 +7,10 @@ Same file format, version, and location as the SM100 tree's
 so the module is reimplemented here rather than imported): winners land in a
 small JSON file keyed by (device, dtype, world_size, geometry, combine wire,
 token-bucket), and knob resolution is a pure dict lookup — no compiles, no
-collectives.  SM107 entries never collide with SM100 ones because the
-``device`` key differs (and so do the knob key names).
+collectives. The ``device`` key has an ``sm107:`` prefix so older SM100
+readers cannot match entries even when GPU model names are identical.
+Implementation revision, nondeterminism permission, and early/late
+routing-weight policy must also match.
 
 Populate with the offline CLI (``python -m flashinfer.moe_ep.tune`` on a
 Rubin node) — see ``.autotune`` for the collective sweep.
@@ -33,6 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _CACHE_VERSION = 1
 _KEY_FIELDS = (
+    "backend_revision",
+    "allow_nondeterministic",
+    "apply_topk_at_fc1",
     "device",
     "dtype",
     "world_size",
@@ -64,6 +69,12 @@ def _current_device_name() -> str:
     if torch.cuda.is_available():
         return torch.cuda.get_device_name(torch.cuda.current_device())
     return "cpu"
+
+
+def _device_key(device: Optional[str]) -> str:
+    # Older backend readers ignore new JSON fields. Namespace an existing
+    # key too, so generic pre-production GPU names cannot collide with SM100.
+    return "sm107:" + (device if device is not None else _current_device_name())
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
@@ -113,13 +124,18 @@ def lookup_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     device: Optional[str] = None,
+    allow_nondeterministic: bool = False,
+    apply_topk_at_fc1: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
     if path is None:
         return None
     key = dict(
-        device=device if device is not None else _current_device_name(),
+        backend_revision="sm107-block-scaled-v2",
+        allow_nondeterministic=allow_nondeterministic,
+        apply_topk_at_fc1=apply_topk_at_fc1,
+        device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
         hidden=hidden,
@@ -134,6 +150,9 @@ def lookup_knobs(
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
+        and (
+            allow_nondeterministic or not e["knobs"].get("reduce_topk_in_kernel", False)
+        )
     ]
     if not matches:
         return None
@@ -159,17 +178,26 @@ def record_knobs(
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
+    allow_nondeterministic: bool = False,
+    apply_topk_at_fc1: bool = True,
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
     Best-effort: returns the cache path written, or ``None`` when the cache is
     disabled or the write failed.
     """
+    if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
+        raise ValueError(
+            "recording in-kernel reduction requires allow_nondeterministic=True"
+        )
     path = _cache_path()
     if path is None:
         return None
     entry = dict(
-        device=device if device is not None else _current_device_name(),
+        backend_revision="sm107-block-scaled-v2",
+        allow_nondeterministic=allow_nondeterministic,
+        apply_topk_at_fc1=apply_topk_at_fc1,
+        device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
         hidden=hidden,
@@ -194,10 +222,9 @@ def record_knobs(
             )
         ]
         entries.append(entry)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=os.path.dirname(path), prefix=".moe_ep_knob_cache."
-        )
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump({"version": _CACHE_VERSION, "entries": entries}, f, indent=1)
@@ -254,6 +281,8 @@ def resolve_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    allow_nondeterministic: bool = False,
+    apply_topk_at_fc1: bool = True,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -268,6 +297,8 @@ def resolve_knobs(
         topk=topk,
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
+        allow_nondeterministic=allow_nondeterministic,
+        apply_topk_at_fc1=apply_topk_at_fc1,
     )
     if cached is not None:
         return cached, "cache"

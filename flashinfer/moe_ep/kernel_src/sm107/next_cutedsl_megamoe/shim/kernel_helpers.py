@@ -24,7 +24,7 @@ in the shim.  Semantics mirror the harness:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -210,6 +210,15 @@ def swizzled_flat_sf_size(rows: int, cols: int) -> int:
     return round_up(rows, SfAtomRows) * round_up(cols, SfAtomCols)
 
 
+def from_blocked(scale: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Recover the logical scale plane from one expert's swizzled bytes."""
+    rb, cb = ceil_div(rows, SfAtomRows), ceil_div(cols, SfAtomCols)
+    raw = scale.view(torch.uint8).reshape(rb, cb, 32, 4, 4)
+    raw = raw.permute(0, 1, 3, 2, 4).reshape(rb, cb, SfAtomRows, SfAtomCols)
+    raw = raw.permute(0, 2, 1, 3).reshape(rb * SfAtomRows, cb * SfAtomCols)
+    return raw[:rows, :cols].contiguous().view(scale.dtype)
+
+
 def interleave_gate_up_16(w13: torch.Tensor, *, intermediate_size: int) -> torch.Tensor:
     """Reorder canonical gate‖up halves into the kernel's 16-row pair stripes.
 
@@ -230,6 +239,105 @@ def interleave_gate_up_16(w13: torch.Tensor, *, intermediate_size: int) -> torch
     gate = gate.unflatten(-2, (pairs, GateUpInterleave))
     up = up.unflatten(-2, (pairs, GateUpInterleave))
     return torch.stack((gate, up), dim=-3).flatten(-4, -2)
+
+
+def preprocess_block_scaled_weights(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    quant_kind: str,
+    intermediate_size: int,
+    chunk_rows: int = 128,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Quantize one expert at a time, with bounded row-wise scratch storage.
+
+    Row chunks align with the 128-row SF swizzle atom, so their swizzled
+    scales can be copied directly into the final plane. No full FP32 expert
+    bank or eight-way FP4 distance bank is materialized.
+    """
+    if chunk_rows <= 0 or chunk_rows % SfAtomRows:
+        raise ValueError(f"chunk_rows must be a positive multiple of {SfAtomRows}.")
+    if quant_kind == "nvfp4":
+        data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+        sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
+    elif quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        data_dtype = (
+            torch.float8_e4m3fn if quant_kind == "mxfp8_e4m3" else torch.float8_e5m2
+        )
+        sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 1
+    else:
+        raise ValueError(f"unsupported quant_kind {quant_kind!r}.")
+
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise ValueError("canonical w13 and w2 must both be 3D tensors.")
+    experts, rows, hidden = w13.shape
+    if experts <= 0 or hidden <= 0 or intermediate_size <= 0:
+        raise ValueError("expert count, hidden, and intermediate must be positive.")
+    if rows != 2 * intermediate_size or w2.shape != (
+        experts,
+        hidden,
+        intermediate_size,
+    ):
+        raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
+    if hidden % (4 * sf_vec) or intermediate_size % (2 * sf_vec):
+        raise ValueError(
+            "weight dimensions do not satisfy the SM107 scale-vector alignment."
+        )
+    if (
+        w13.device != w2.device
+        or not w13.is_floating_point()
+        or not w2.is_floating_point()
+    ):
+        raise ValueError(
+            "canonical weights must be floating-point tensors on the same device."
+        )
+
+    def transform(weight: torch.Tensor, *, gate_up: bool):
+        experts, rows, cols = weight.shape
+        data = torch.empty(
+            (experts, rows, cols // packing), dtype=data_dtype, device=weight.device
+        )
+        sf_cols = round_up(cols // sf_vec, SfAtomCols)
+        scales = torch.empty(
+            (experts, swizzled_flat_sf_size(rows, cols // sf_vec)),
+            dtype=torch.uint8,
+            device=weight.device,
+        )
+        for expert in range(experts):
+            source = weight[expert]
+            if gate_up:
+                source = interleave_gate_up_16(
+                    source, intermediate_size=intermediate_size
+                )
+            for begin in range(0, rows, chunk_rows):
+                end = min(begin + chunk_rows, rows)
+                block = source[begin:end].to(torch.float32).contiguous()
+                if quant_kind == "nvfp4":
+                    q, sf = quantize_nvfp4_block16(block)
+                else:
+                    q, sf = quantize_mxfp8_block32(block, data_dtype)
+                data[expert, begin:end].view(torch.uint8).copy_(q.view(torch.uint8))
+                swizzled = to_blocked(sf.view(torch.uint8))
+                offset = begin * sf_cols
+                scales[expert, offset : offset + swizzled.numel()].copy_(swizzled)
+        return data.permute(0, 2, 1), scales.view(sf_dtype)
+
+    return transform(w13, gate_up=True), transform(w2, gate_up=False)
+
+
+def concatenate_block_scaled_weights(
+    parts: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Join expert chunks without changing the physical K-major layout."""
+    if not parts:
+        raise ValueError("at least one transformed weight chunk is required.")
+    weights = torch.cat(
+        [w.permute(0, 2, 1).view(torch.uint8) for w, _ in parts], dim=0
+    ).view(parts[0][0].dtype)
+    scales = torch.cat([sf.view(torch.uint8) for _, sf in parts], dim=0).view(
+        parts[0][1].dtype
+    )
+    return weights.permute(0, 2, 1), scales
 
 
 def _dequant_activation(
@@ -290,6 +398,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     gate_up_clamp: Optional[float],
     apply_topk_at_fc1: bool,
     num_tokens: Optional[int] = None,
+    weight_scales_are_swizzled: bool = False,
+    return_fp32: bool = False,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the SM107 block-scaled inference kernel.
 
@@ -320,9 +430,12 @@ def compute_megamoe_reference_sm107_block_scaled(
         if routed.shape[0] == 0:
             continue
         src_t, src_k = routed[:, 0], routed[:, 1]
-        w1 = _dequant_weight_k_major(
-            quant_kind, fc1_weight_k_major[local_e], fc1_weight_sf_raw[local_e]
-        )
+        vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
+        sf1, sf2 = fc1_weight_sf_raw[local_e], fc2_weight_sf_raw[local_e]
+        if weight_scales_are_swizzled:
+            sf1 = from_blocked(sf1, 2 * intermediate, hidden // vec)
+            sf2 = from_blocked(sf2, hidden, intermediate // vec)
+        w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
         fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
@@ -340,15 +453,13 @@ def compute_megamoe_reference_sm107_block_scaled(
         else:
             act = act_q.to(torch.float32)
         act = act * scale_to_f32(act_sf).repeat_interleave(vec, dim=1)
-        w2 = _dequant_weight_k_major(
-            quant_kind, fc2_weight_k_major[local_e], fc2_weight_sf_raw[local_e]
-        )
+        w2 = _dequant_weight_k_major(quant_kind, fc2_weight_k_major[local_e], sf2)
         term = (act @ w2.transpose(0, 1)).to(torch.bfloat16).to(torch.float32)
         if not apply_topk_at_fc1:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 
-    return output.to(torch.bfloat16)
+    return output if return_fp32 else output.to(torch.bfloat16)
 
 
 __all__ = [
@@ -357,9 +468,12 @@ __all__ = [
     "Nvfp4BlockSize",
     "ceil_div",
     "compute_megamoe_reference_sm107_block_scaled",
+    "concatenate_block_scaled_weights",
     "e8m0_to_f32",
+    "from_blocked",
     "interleave_gate_up_16",
     "pack_f32_to_fp4",
+    "preprocess_block_scaled_weights",
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "round_up",

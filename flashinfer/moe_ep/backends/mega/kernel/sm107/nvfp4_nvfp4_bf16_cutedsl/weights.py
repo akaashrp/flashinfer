@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Tuple
 
 from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ..validation import validate_weight_layout
 from ...weight_validation import (
     check_transformed_mega_weights_structure,
     check_transformed_weight_pair,
@@ -59,8 +60,6 @@ def preprocess_mega_weights(
     Pre-quantized packs are not supported yet (the kernel-layout + swizzled-SF
     import path can be added when a producer exists).
     """
-    import torch
-
     if isinstance(weights, PrequantizedMoEWeights):
         raise MoEEpConfigError(
             "pre-quantized weights are not supported by the "
@@ -70,12 +69,12 @@ def preprocess_mega_weights(
 
     # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
-        interleave_gate_up_16,
-        quantize_nvfp4_block16,
-        to_blocked,
+        preprocess_block_scaled_weights,
     )
 
     w13, w2 = weights.w13, weights.w2
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise MoEEpConfigError("canonical w13 and w2 must both be 3D tensors")
     num_local_experts = w13.shape[0]
     fc1_out = 2 * intermediate_size
     if tuple(w13.shape) != (num_local_experts, fc1_out, hidden_size):
@@ -89,28 +88,9 @@ def preprocess_mega_weights(
             f"({num_local_experts}, {hidden_size}, {intermediate_size})"
         )
 
-    # FC1: interleave the gate‖up halves into 16-row pair stripes, quantize
-    # along K (hidden, the trailing dim; also the fp4 pack axis), then expose
-    # the kernel's logical (E, hidden/2, 2I) view with packed-hidden stride-1.
-    w13_interleaved = interleave_gate_up_16(
-        w13.to(torch.float32), intermediate_size=intermediate_size
-    ).contiguous()
-    fc1_q, fc1_sf = quantize_nvfp4_block16(w13_interleaved)
-    fc1_weight = fc1_q.permute(0, 2, 1)
-
-    # FC2: quantize along K (intermediate, the trailing dim of canonical w2),
-    # then expose the logical (E, intermediate/2, hidden) view.
-    fc2_q, fc2_sf = quantize_nvfp4_block16(w2.to(torch.float32).contiguous())
-    fc2_weight = fc2_q.permute(0, 2, 1)
-
-    fc1_weight_sf = torch.stack(
-        [to_blocked(fc1_sf[e].view(torch.uint8)) for e in range(num_local_experts)]
-    ).view(torch.float8_e4m3fn)
-    fc2_weight_sf = torch.stack(
-        [to_blocked(fc2_sf[e].view(torch.uint8)) for e in range(num_local_experts)]
-    ).view(torch.float8_e4m3fn)
-
-    return ((fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf))
+    return preprocess_block_scaled_weights(
+        w13, w2, quant_kind="nvfp4", intermediate_size=intermediate_size
+    )
 
 
 def validate_transformed_mega_weights(
@@ -156,3 +136,5 @@ def validate_transformed_mega_weights(
             swizzled_flat_sf_size(hidden_size, intermediate_size // Nvfp4BlockSize),
         ),
     )
+    for weight, scale in transformed:
+        validate_weight_layout(weight, scale, scale_dtype=torch.float8_e4m3fn)

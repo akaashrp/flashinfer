@@ -1,41 +1,27 @@
-"""4-GPU SM107 (Rubin) block-scaled mega kernel latency benchmark.
+"""Native SM107 MegaMoE kernel and MoEEpLayer.forward latency benchmark.
 
-Reproduces the upstream cutedsl_megamoe Rubin perf-report protocol
-(tested upstream at 47881ad2 / vendored 92dd334) on the flashinfer moe_ep
-backends: DSv4-Pro EP4 shape (hidden 7168, MoE intermediate 3072, 384 total
-experts, top-k 6, BF16 combine), NVFP4 and/or MXFP8 (--quant-kind; the
-upstream baseline is NVFP4-only), balanced + power-law(0.8) routing,
-5 warmup + 20 measured iterations, per-rank averages.
+Use --mode kernel|forward and --execution eager|graph to select the span.
+The primary metric is p50 of per-iteration maximum rank latency; JSONL
+preserves every sample, resolved knobs, shape, seed, environment, accuracy,
+and memory. A sampled Torch oracle gates every result.
 
-Timing covers ONLY the fused mega kernel launch (dispatch + FC1 + SwiGLU +
-FC2 + combine) via the shim's steady-state launch thunk over pre-staged
-inputs — the same span the upstream tester times. Input staging (torch
-quantization fallback) is deliberately outside the timed region.
+Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
+    torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \\
+        --quant-kind all --routing both --mode forward --execution graph
 
-Timed-loop protocol replicates upstream ``tester/solver.py::perf_run``:
-back-to-back launches with a per-iteration L2 flush (a throwaway 300MB
-``randn`` on the stream, outside the event window — upstream
-``host_utils.l2_flush``). The flush both cold-caches each iteration and
-separates consecutive launches; ``--no-l2-flush`` restores the raw
-back-to-back mode (small-token latencies then read low because iteration
-i+1's dispatch overlaps iteration i's combine tail).
-
-Run (whole node, 4 Rubin GPUs)::
-
-    torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
-        --routing balanced --tokens 1024,2048,4096,8192,16384,32768
-
-Results are appended as JSON lines to ``--output`` (rank 0 only) and printed
-as a markdown table row per problem size. See
-``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md``.
+See kernel_src/sm107/next_cutedsl_megamoe/TUNING.md for the complete
+qualification matrix and the distinction between default, heuristic,
+cached, and historically reported knob profiles.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-from typing import Optional, Tuple
+import statistics
+import time
 
 import torch
 import torch.distributed as dist
@@ -65,22 +51,6 @@ WINNERS = {
     ("power_law", 8192): dict(tile=(256, 256, 256), hint=3, epi=(1, 4), tif=1),
     ("power_law", 16384): dict(tile=(256, 256, 256), hint=3, epi=(1, 4), tif=4),
     ("power_law", 32768): dict(tile=(256, 256, 256), hint=3, epi=(1, 4), tif=4),
-}
-
-# Upstream reference latencies (us) for the reference column, upstream commit 47881ad2 (2026-08-15).
-UPSTREAM_US = {
-    ("balanced", 1024): 372.22,
-    ("balanced", 2048): 410.48,
-    ("balanced", 4096): 529.56,
-    ("balanced", 8192): 800.48,
-    ("balanced", 16384): 1484.16,
-    ("balanced", 32768): 2960.92,
-    ("power_law", 1024): 399.75,
-    ("power_law", 2048): 474.56,
-    ("power_law", 4096): 621.76,
-    ("power_law", 8192): 1053.01,
-    ("power_law", 16384): 2081.84,
-    ("power_law", 32768): 4023.79,
 }
 
 
@@ -141,6 +111,9 @@ def _make_routing(world, tokens, routing, alpha):
 def _local_transformed_weights(rank: int, world: int, quant_kind: str):
     """Random local expert slice, quantized chunk-wise to bound peak memory."""
     from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        concatenate_block_scaled_weights,
+    )
 
     if quant_kind == "nvfp4":
         from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
@@ -157,7 +130,7 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
 
     experts_per_rank = NUM_EXPERTS // world
     generator = torch.Generator(device="cuda").manual_seed(SEED + 7 * rank)
-    fc1_parts, fc1_sf_parts, fc2_parts, fc2_sf_parts = [], [], [], []
+    fc1_parts, fc2_parts = [], []
     for begin in range(0, experts_per_rank, WEIGHT_CHUNK_EXPERTS):
         count = min(WEIGHT_CHUNK_EXPERTS, experts_per_rank - begin)
         w13 = (
@@ -188,15 +161,13 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
             hidden_size=HIDDEN,
             **extra,
         )
-        fc1_parts.append(fc1_w)
-        fc1_sf_parts.append(fc1_sf.reshape(count, -1))
-        fc2_parts.append(fc2_w)
-        fc2_sf_parts.append(fc2_sf.reshape(count, -1))
+        fc1_parts.append((fc1_w, fc1_sf.reshape(count, -1)))
+        fc2_parts.append((fc2_w, fc2_sf.reshape(count, -1)))
         del w13, w2
         torch.cuda.empty_cache()
     return (
-        (torch.cat(fc1_parts), torch.cat(fc1_sf_parts)),
-        (torch.cat(fc2_parts), torch.cat(fc2_sf_parts)),
+        concatenate_block_scaled_weights(fc1_parts),
+        concatenate_block_scaled_weights(fc2_parts),
     )
 
 
@@ -207,19 +178,64 @@ def _l2_flush() -> None:
     _ = torch.randn(300 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
 
 
-def _bench_one(
-    rank: int,
-    world: int,
-    tokens: int,
-    routing: str,
-    alpha: float,
-    transformed,
-    warmup: int,
-    iters: int,
-    quant_kind: str = "nvfp4",
-    l2_flush: bool = True,
-    knobs_override: Optional[dict] = None,
-) -> Tuple[dict, list]:
+def _summarize_samples(per_rank):
+    """Collective latency is the slowest rank in each matched iteration."""
+    maxima = [max(samples) for samples in zip(*per_rank, strict=True)]
+    return {
+        "p50_max_rank_us": statistics.median(maxima),
+        "p95_max_rank_us": sorted(maxima)[max(0, math.ceil(0.95 * len(maxima)) - 1)],
+        "mean_max_rank_us": statistics.mean(maxima),
+        "mean_rank_us": statistics.mean(v for rank in per_rank for v in rank),
+        "min_us": min(v for rank in per_rank for v in rank),
+        "max_us": max(v for rank in per_rank for v in rank),
+        "per_rank_samples_us": per_rank,
+        "per_iteration_max_rank_us": maxima,
+    }
+
+
+def _selected_knobs(pkg, policy, tokens, capacity, routing, quant_kind, world):
+    if policy == "default":
+        return None
+    if policy == "heuristic":
+        return pkg.default_knobs(capacity, quant_kind=quant_kind)
+    if policy == "cache":
+        return "cache"
+    if policy != "reported":
+        value = json.loads(policy)
+        if not isinstance(value, dict):
+            raise ValueError("--knobs must name a policy or contain a JSON knob object")
+        return {k: tuple(v) if isinstance(v, list) else v for k, v in value.items()}
+    if world != 4 or (HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K) != (7168, 3072, 384, 6):
+        raise ValueError(
+            "the reported profile only applies to H7168/I3072/E384/K6 at EP4"
+        )
+    if (routing, tokens) not in WINNERS:
+        raise ValueError(
+            "no reported profile for this routing/token count; use default, heuristic, cache, or explicit knobs"
+        )
+    row = WINNERS[(routing, tokens)]
+    return dict(
+        mma_tiler_mnk=(
+            row["tile"][0],
+            row["tile"][1],
+            256 if quant_kind == "nvfp4" else 128,
+        ),
+        cluster_shape_mn=(4, 1),
+        fallback_cluster_shape_mn=(2, 1),
+        schedule_policy=("phase_interleave", row["hint"]),
+        work_id_mode="atomic_counter",
+        fc2_use_bulk=True,
+        fc2_tma_stages=2,
+        epi_flag_batches=tuple(row["epi"]),
+        token_in_flag_batch=row["tif"],
+        token_back_mode="epi_warps",
+        reduce_topk_in_kernel=False,
+    )
+
+
+def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_kind):
+    import dataclasses
+
     import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -231,46 +247,21 @@ def _bench_one(
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
-    if (routing, tokens) not in WINNERS:
-        raise SystemExit(
-            f"no tuned knobs for routing={routing} tokens={tokens}; "
-            f"available token counts: "
-            f"{sorted({t for r, t in WINNERS if r == routing})}"
-        )
-    knobs = dict(WINNERS[(routing, tokens)])
-    if knobs_override:
-        knobs.update(knobs_override)
-    # WINNERS tiles are the nvfp4 selections (2x-mode instruction K 128, tile
-    # K 256). mxfp8's 2x-mode instruction K is 64, so the analogous tile K is
-    # 128; M/N and the scheduler knobs carry over unchanged.
-    tile = tuple(knobs["tile"])
-    if quant_kind != "nvfp4":
-        tile = (tile[0], tile[1], 128)
-        knobs["tile"] = tile
-
-    common = dict(
-        intermediate_size=INTERMEDIATE,
-        top_k=TOP_K,
-        in_kernel_fc2_reduce=False,  # separate top-k reduction (upstream winners)
-        schedule_policy=("phase_interleave", knobs["hint"]),
-        work_id_mode="atomic_counter",
-        fc2_use_bulk=True,
-        fc2_tma_stages=2,
-        epi_flag_batches=tuple(knobs["epi"]),
-        token_in_flag_batch=knobs["tif"],
-        mma_tiler_mnk=tile,
-        cluster_shape_mn=(4, 1),
-        fallback_cluster_shape_mn=(2, 1),
+    selection = _selected_knobs(
+        pkg, args.knobs, tokens, capacity, routing, quant_kind, world
     )
-    if quant_kind == "nvfp4":
-        cfg = Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
-    else:
-        cfg = Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
+    common = dict(intermediate_size=INTERMEDIATE, top_k=TOP_K, knobs=selection)
+    cfg = (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "nvfp4"
+        else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
+    )
+    torch.cuda.reset_peak_memory_stats()
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(world_size=world, rank=rank, auto_bootstrap=False),
         fleet_params=FleetParams(
             num_experts=NUM_EXPERTS,
-            max_tokens_per_rank=tokens,
+            max_tokens_per_rank=capacity,
             token_hidden_size=HIDDEN,
         ),
         weights=None,
@@ -280,72 +271,181 @@ def _bench_one(
         gen = torch.Generator(device="cuda").manual_seed(SEED + 13 * rank + tokens)
         x = torch.randn(
             tokens, HIDDEN, device="cuda", dtype=torch.float32, generator=gen
-        ).to(torch.bfloat16)
-        topk_idx, topk_weights = _make_routing(world, tokens, routing, alpha)
-
-        # First forward: stages inputs, compiles, and validates the pipeline.
+        ).bfloat16()
+        topk_idx, topk_weights = _make_routing(world, tokens, routing, args.alpha)
+        tensors = MoEEpTensors(x, topk_idx[rank], topk_weights[rank])
         dist.barrier()
-        y = layer.forward(
-            MoEEpTensors(
-                hidden_states=x,
-                topk_ids=topk_idx[rank],
-                topk_weights=topk_weights[rank],
-            )
+        layer.forward(tensors)
+        indices, expected = pkg.sampled_reference(
+            layer._workspace, *transformed, tokens
         )
-        if not torch.isfinite(y.to(torch.float32)).all():
-            raise RuntimeError("non-finite output from warmup forward")
-
-        # Steady-state: relaunch the fused kernel over the staged inputs.
-        thunk = pkg.sm107_block_scaled_mega_launch_thunk(
-            layer._transformed[0], layer._transformed[1], layer._workspace
+        invoke = (
+            pkg.sm107_block_scaled_mega_launch_thunk(*transformed, layer._workspace)
+            if args.mode == "kernel"
+            else lambda: layer.forward(tensors)
         )
         torch.cuda.synchronize()
-        dist.barrier()
-        for _ in range(warmup):
-            thunk()
+        for _ in range(args.warmup):
+            invoke()
         torch.cuda.synchronize()
+        if args.execution == "graph":
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                invoke()
+            invoke = graph.replay
         dist.barrier()
-
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-        stops = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-        for i in range(iters):
-            if l2_flush:
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
+        stops = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
+        for i in range(args.iters):
+            if not args.no_l2_flush:
                 _l2_flush()
             starts[i].record()
-            thunk()
+            invoke()
             stops[i].record()
         torch.cuda.synchronize()
-        samples_us = [starts[i].elapsed_time(stops[i]) * 1000.0 for i in range(iters)]
-    finally:
-        layer.destroy()
-
-    avg = sum(samples_us) / len(samples_us)
-    return (
-        dict(
-            routing=routing,
-            tokens=tokens,
+        samples = [
+            a.elapsed_time(b) * 1000.0 for a, b in zip(starts, stops, strict=False)
+        ]
+        error = pkg.output_error(
+            layer._workspace.output_activation[:tokens], indices, expected
+        )
+        error_tensor = torch.tensor(error, device="cuda", dtype=torch.float64)
+        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
+        if float(error_tensor) > (0.06 if quant_kind == "nvfp4" else 0.02):
+            raise RuntimeError(
+                f"benchmark output failed sampled Torch oracle: rel_l2={float(error_tensor)}"
+            )
+        workspace = layer._workspace
+        counts = torch.bincount(
+            topk_idx.flatten().long(), minlength=NUM_EXPERTS
+        ).float()
+        result = dict(
             rank=rank,
-            avg_us=avg,
-            min_us=min(samples_us),
-            max_us=max(samples_us),
-            knobs=knobs,
-            l2_flush=l2_flush,
+            routing=routing,
+            alpha=args.alpha,
+            seed=SEED,
+            quant_kind=quant_kind,
+            tokens=tokens,
+            capacity=capacity,
+            hidden=HIDDEN,
+            intermediate=INTERMEDIATE,
+            num_experts=NUM_EXPERTS,
+            topk=TOP_K,
+            world_size=world,
+            mode=args.mode,
+            execution=args.execution,
+            l2_flush=not args.no_l2_flush,
+            warmup=args.warmup,
+            iterations=args.iters,
+            knob_policy=args.knobs,
+            resolved_config=dataclasses.asdict(workspace.config),
+            relative_l2_max_rank=float(error_tensor),
+            oracle_sample_rows=int(indices.numel()),
+            routing_max_mean=float(counts.max() / counts.mean()),
+            torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+            torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+            workspace_bytes={
+                name: getattr(workspace, name).numel()
+                * getattr(workspace, name).element_size()
+                for name in (
+                    "x",
+                    "x_sf",
+                    "topk_idx",
+                    "topk_weights",
+                    "output_activation",
+                    "local_workspace",
+                    "shared_workspace",
+                )
+            },
+        )
+        if args.execution == "graph":
+            del invoke, graph
+    except BaseException:
+        # Failure is fatal to the distributed job. Do not enter a collective
+        # free while a peer might be stuck in a kernel or have a CUDA fault.
+        layer = None
+        raise
+    finally:
+        if layer is not None:
+            layer.destroy()
+    return result, samples
+
+
+def _environment():
+    import datetime
+    import importlib.metadata
+    import subprocess
+
+    def command(argv):
+        try:
+            return subprocess.check_output(
+                argv, text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    versions = {}
+    for package in ("nvidia-cutlass-dsl", "cuda-python", "nvshmem4py-cu13"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return dict(
+        timestamp_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        git_revision=command(["git", "rev-parse", "HEAD"]),
+        git_status=command(["git", "status", "--porcelain"]),
+        torch=torch.__version__,
+        torch_cuda=torch.version.cuda,
+        gpu_name=torch.cuda.get_device_name(),
+        compute_capability=torch.cuda.get_device_capability(),
+        gpu_total_memory=torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).total_memory,
+        driver=command(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]
         ),
-        samples_us,
+        versions=versions,
+        environment={
+            key: os.environ.get(key)
+            for key in (
+                "CUTE_DSL_ARCH",
+                "NVSHMEM_SYMMETRIC_SIZE",
+                "NVSHMEM_DISABLE_NVLS",
+                "CUDA_VISIBLE_DEVICES",
+            )
+        },
     )
 
 
-def main() -> None:
+def main():
+    global HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", default="1024,2048,4096,8192,16384,32768")
     parser.add_argument(
-        "--quant-kind", default="nvfp4", choices=["nvfp4", "mxfp8_e4m3", "both"]
+        "--capacity",
+        type=int,
+        help="fixed capacity >= every live token count; default: live size",
     )
+    parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument("--intermediate", type=int, default=INTERMEDIATE)
+    parser.add_argument("--num-experts", type=int, default=NUM_EXPERTS)
+    parser.add_argument("--topk", type=int, default=TOP_K)
+    parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
-        "--no-l2-flush",
-        action="store_true",
-        help="drop the upstream per-iteration L2 flush (raw back-to-back mode)",
+        "--quant-kind",
+        default="nvfp4",
+        choices=["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "both", "all"],
     )
+    parser.add_argument("--mode", choices=["kernel", "forward"], default="kernel")
+    parser.add_argument("--execution", choices=["eager", "graph"], default="eager")
+    parser.add_argument(
+        "--knobs",
+        default="default",
+        help="default, heuristic, cache, reported, or a JSON knob object",
+    )
+    parser.add_argument("--no-l2-flush", action="store_true")
     parser.add_argument(
         "--routing", default="balanced", choices=["balanced", "power_law", "both"]
     )
@@ -354,12 +454,28 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--output", default="bench_sm107_mega_results.jsonl")
     args = parser.parse_args()
-
-    rank = int(os.environ.get("RANK", "0"))
-    world = int(os.environ.get("WORLD_SIZE", "1"))
+    HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
+        args.hidden,
+        args.intermediate,
+        args.num_experts,
+        args.topk,
+        args.seed,
+    )
+    token_list = [int(t) for t in args.tokens.split(",")]
+    if min(token_list) < 1 or args.warmup < 1 or args.iters < 1:
+        parser.error("tokens, warmup, and iters must be positive")
+    if args.capacity is not None and args.capacity < max(token_list):
+        parser.error("--capacity must cover every live token count")
+    rank, world = (
+        int(os.environ.get("RANK", "0")),
+        int(os.environ.get("WORLD_SIZE", "1")),
+    )
     if world < 2:
-        raise SystemExit("run under torchrun with >= 2 ranks (EP benchmark)")
-
+        parser.error("run under torchrun with at least two EP ranks")
+    if NUM_EXPERTS % world or not 1 <= TOP_K <= NUM_EXPERTS:
+        parser.error(
+            "num-experts must divide across ranks and topk must be in [1, num-experts]"
+        )
     from flashinfer.moe_ep import (
         BootstrapConfig,
         bootstrap_moe_ep_runtime,
@@ -367,101 +483,89 @@ def main() -> None:
         finalize_moe_ep_runtime,
     )
     from flashinfer.moe_ep.core.runtime import sm107_block_scaled_runtime_requirements
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        require_sm107_dsl,
+    )
 
     bootstrap = BootstrapConfig(world_size=world, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
+    if torch.cuda.get_device_capability() != (10, 7):
+        parser.error("this benchmark requires native SM107 GPUs")
+    require_sm107_dsl()
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, sm107_block_scaled_runtime_requirements(bootstrap)
     )
-
-    token_list = [int(t) for t in args.tokens.split(",")]
     routings = ["balanced", "power_law"] if args.routing == "both" else [args.routing]
-    kinds = ["nvfp4", "mxfp8_e4m3"] if args.quant_kind == "both" else [args.quant_kind]
+    kinds = (
+        ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
+        if args.quant_kind == "all"
+        else ["nvfp4", "mxfp8_e4m3"]
+        if args.quant_kind == "both"
+        else [args.quant_kind]
+    )
+    environment = _environment()
     try:
-        for quant_kind in kinds:
-            transformed = _local_transformed_weights(rank, world, quant_kind)
-            if rank == 0:
-                print(
-                    f"# sm107 {quant_kind} mega EP{world}: hidden={HIDDEN} "
-                    f"inter={INTERMEDIATE} experts={NUM_EXPERTS} topk={TOP_K} "
-                    f"warmup={args.warmup} iters={args.iters}",
-                    flush=True,
-                )
+        for kind in kinds:
+            torch.cuda.reset_peak_memory_stats()
+            start = time.perf_counter()
+            transformed = _local_transformed_weights(rank, world, kind)
+            torch.cuda.synchronize()
+            preparation = dict(
+                elapsed_seconds=time.perf_counter() - start,
+                torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+            )
             for routing in routings:
                 for tokens in token_list:
                     result, samples = _bench_one(
                         rank,
                         world,
                         tokens,
+                        args.capacity or tokens,
                         routing,
-                        args.alpha,
                         transformed,
-                        args.warmup,
-                        args.iters,
-                        quant_kind=quant_kind,
+                        args,
+                        kind,
                     )
-                    # Aggregate: mean of rank averages; min/max over every sample.
-                    stats = torch.tensor(
-                        [result["avg_us"], result["min_us"], result["max_us"]],
-                        device="cuda",
+                    local = dict(
+                        result=result,
+                        samples_us=samples,
+                        preprocessing=preparation,
+                        environment=environment,
                     )
-                    gathered = [torch.zeros_like(stats) for _ in range(world)]
-                    dist.all_gather(gathered, stats)
+                    gathered = [None] * world
+                    dist.all_gather_object(gathered, local)
                     if rank == 0:
-                        avg = sum(g[0].item() for g in gathered) / world
-                        lo = min(g[1].item() for g in gathered)
-                        hi = max(g[2].item() for g in gathered)
-                        flops = tokens * TOP_K * 6 * HIDDEN * INTERMEDIATE
-                        tflops = (
-                            flops / (avg * 1e-6) / 1e12
-                            if routing == "balanced"
-                            else None
+                        summary = _summarize_samples(
+                            [r["samples_us"] for r in gathered]
                         )
-                        # The upstream report is NVFP4-only; mxfp8 has no baseline.
-                        ref = (
-                            UPSTREAM_US.get((routing, tokens))
-                            if quant_kind == "nvfp4"
-                            else None
+                        summary["model_tflops_per_rank"] = (
+                            tokens
+                            * TOP_K
+                            * 6
+                            * HIDDEN
+                            * INTERMEDIATE
+                            / summary["p50_max_rank_us"]
+                            / 1e6
                         )
-                        knobs = result["knobs"]
-                        tflops_col = f"{tflops:.1f}" if tflops is not None else "-"
-                        ref_col = f"{ref:.2f}" if ref is not None else "-"
-                        detail = (
-                            f"tile {'x'.join(map(str, knobs['tile']))}; "
-                            f"hint {knobs['hint']}; "
-                            f"epi {knobs['epi'][0]}x{knobs['epi'][1]}; "
-                            f"tif {knobs['tif']}"
-                        )
-                        # Reference first, then our result with the inline
-                        # latency ratio (ours/reference) — no signed-percent
-                        # delta column (easy to misread).
-                        ours = f"{avg:.2f} ({avg / ref:.2f}x)" if ref else f"{avg:.2f}"
+                        record = dict(result, **summary, per_rank=gathered)
+                        with open(args.output, "a") as stream:
+                            stream.write(json.dumps(record) + "\n")
                         print(
-                            f"| {quant_kind} | {routing} | {tokens} | {ref_col} | "
-                            f"{ours} | {lo:.2f}-{hi:.2f} | {tflops_col} | {detail} |",
+                            f"{kind} EP{world} {routing} T={tokens}/{args.capacity or tokens} "
+                            f"{args.mode}/{args.execution}: p50(max rank)={summary['p50_max_rank_us']:.2f} us, "
+                            f"p95={summary['p95_max_rank_us']:.2f} us, rel_l2={result['relative_l2_max_rank']:.5f}",
                             flush=True,
                         )
-                        with open(args.output, "a") as fh:
-                            fh.write(
-                                json.dumps(
-                                    dict(
-                                        result,
-                                        quant_kind=quant_kind,
-                                        rank_avgs=[g[0].item() for g in gathered],
-                                        mean_us=avg,
-                                        min_us=lo,
-                                        max_us=hi,
-                                        tflops=tflops,
-                                        upstream_us=ref,
-                                    )
-                                )
-                                + "\n"
-                            )
                     dist.barrier()
             del transformed
             torch.cuda.empty_cache()
+    except BaseException:
+        runtime = None
+        raise
     finally:
-        finalize_moe_ep_runtime(runtime)
+        if runtime is not None:
+            finalize_moe_ep_runtime(runtime)
 
 
 if __name__ == "__main__":

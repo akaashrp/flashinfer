@@ -28,12 +28,13 @@ before the first launch.
 from __future__ import annotations
 
 import dataclasses
-import os
+import math
 from typing import Any, Literal, Optional, Tuple
 
 import torch
 
 from . import comm
+from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
@@ -63,13 +64,7 @@ def _require_sm107() -> None:
 
 
 def _configure_dsl_arch() -> None:
-    configured = os.environ.get("CUTE_DSL_ARCH")
-    if configured not in (None, "sm_107", "sm_107a"):
-        raise RuntimeError(
-            f"CUTE_DSL_ARCH must target SM107 for the Rubin mega kernel, "
-            f"got {configured!r}."
-        )
-    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    require_sm107_dsl()
 
 
 def _fp4_storage_dtype() -> torch.dtype:
@@ -110,13 +105,14 @@ _MAX_ACTIVE_CLUSTERS_CACHE: dict = {}
 
 
 def _max_active_clusters(cluster_size: int) -> int:
-    """Occupancy probe (compiles a helper kernel; cached per cluster size)."""
-    cached = _MAX_ACTIVE_CLUSTERS_CACHE.get(cluster_size)
+    """Occupancy probe, cached per device and cluster size."""
+    key = (torch.cuda.current_device(), cluster_size)
+    cached = _MAX_ACTIVE_CLUSTERS_CACHE.get(key)
     if cached is None:
         import cutlass.utils as cutlass_utils
 
         cached = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
-        _MAX_ACTIVE_CLUSTERS_CACHE[cluster_size] = cached
+        _MAX_ACTIVE_CLUSTERS_CACHE[key] = cached
     return cached
 
 
@@ -156,17 +152,39 @@ class Sm107BlockScaledMoeConfig:
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
-        if self.world_size < 1 or not (0 <= self.rank < self.world_size):
+        for name in (
+            "num_total_experts",
+            "max_tokens_per_rank",
+            "num_topk",
+            "hidden",
+            "intermediate",
+            "world_size",
+            "token_padding_block",
+            "sf_padding_block",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive Python integer.")
+        if type(self.rank) is not int or not (0 <= self.rank < self.world_size):
             raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
+        for name in ("fc2_use_bulk", "reduce_topk_in_kernel", "apply_topk_at_fc1"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a Python bool.")
+        if self.num_total_experts > 16384:
+            raise ValueError("SM107 routing supports at most 16384 global experts.")
+        if self.num_topk > self.num_total_experts:
+            raise ValueError("num_topk must not exceed num_total_experts.")
+        if self.padded_tokens_per_rank * self.num_topk > 2097152:
+            raise ValueError("SM107 routing supports at most 2097152 routes per rank.")
         if self.num_total_experts % self.world_size != 0:
             raise ValueError(
                 f"num_total_experts ({self.num_total_experts}) must divide evenly "
                 f"across world_size ({self.world_size})."
             )
         vec = self.sf_vec_size
-        if self.hidden % (2 * vec) != 0:
+        if self.hidden % (4 * vec) != 0:
             raise ValueError(
-                f"hidden ({self.hidden}) must be a multiple of {2 * vec} "
+                f"hidden ({self.hidden}) must be a multiple of {4 * vec} "
                 f"for {self.quant_kind}."
             )
         if self.intermediate % (2 * vec) != 0 or self.intermediate % 32 != 0:
@@ -179,6 +197,10 @@ class Sm107BlockScaledMoeConfig:
         instruction_k = self.instruction_k
         if len(tiler) != 3:
             raise ValueError("mma_tiler_mnk must be a 3-tuple.")
+        if any(type(dim) is not int or dim <= 0 for dim in tiler):
+            raise ValueError(
+                "mma_tiler_mnk dimensions must be positive Python integers."
+            )
         if tiler[0] not in (128, 256):
             raise ValueError(f"Rubin instruction M must be 128 or 256, got {tiler[0]}.")
         if tiler[1] not in (64, 128, 256):
@@ -198,6 +220,11 @@ class Sm107BlockScaledMoeConfig:
             raise ValueError("nvfp4 does not support (N=256, K=4x-instruction) tiles.")
         if len(self.cluster_shape_mn) != 2:
             raise ValueError("cluster_shape_mn must be a 2-tuple.")
+        cm, cn = self.cluster_shape_mn
+        if type(cm) is not int or cm <= 0 or cm > 16 or cm & (cm - 1):
+            raise ValueError("cluster M must be a power of two no greater than 16.")
+        if type(cn) is not int or cn != 1:
+            raise ValueError("the swap-AB FC12 path requires cluster N=1.")
         if tiler[0] == 256 and self.cluster_shape_mn[0] % 2 != 0:
             raise ValueError("instruction M 256 requires an even cluster M.")
         if self.fallback_cluster_shape_mn is not None:
@@ -209,7 +236,7 @@ class Sm107BlockScaledMoeConfig:
             else:
                 if len(fallback) != 2:
                     raise ValueError("fallback_cluster_shape_mn must be a 2-tuple.")
-                if any(dim <= 0 for dim in fallback):
+                if any(type(dim) is not int or dim <= 0 for dim in fallback):
                     raise ValueError(
                         "fallback_cluster_shape_mn dimensions must be positive."
                     )
@@ -239,16 +266,28 @@ class Sm107BlockScaledMoeConfig:
                     )
         if self.token_padding_block % 64 != 0:
             raise ValueError("token_padding_block must be a multiple of 64.")
+        if self.sf_padding_block % 128 != 0:
+            raise ValueError("sf_padding_block must be a multiple of 128.")
         if tiler[1] % self.token_padding_block != 0:
             raise ValueError(
                 f"mma tiler N ({tiler[1]}) must be a whole number of token "
                 f"padding blocks ({self.token_padding_block})."
             )
+        if len(self.schedule_policy) != 2:
+            raise ValueError("schedule_policy requires (mode, hint).")
         mode, hint = self.schedule_policy
         if mode not in ("grouped", "phase_interleave"):
             raise ValueError(f"unknown schedule mode {mode!r}.")
-        if hint is not None and hint <= 0:
-            raise ValueError("schedule hint must be positive or None.")
+        if hint is not None and (type(hint) is not int or hint <= 0):
+            raise ValueError("schedule hint must be a positive Python integer or None.")
+        if self.work_id_mode not in ("grid_stride", "atomic_counter"):
+            raise ValueError(f"unknown work_id_mode {self.work_id_mode!r}.")
+        if self.token_back_mode not in (
+            "epi_warps",
+            "standalone_warps",
+            "reuse_dispatch_warps",
+        ):
+            raise ValueError(f"unknown token_back_mode {self.token_back_mode!r}.")
         if mode == "phase_interleave" and self.work_id_mode != "atomic_counter":
             raise ValueError(
                 "schedule_policy 'phase_interleave' requires "
@@ -256,10 +295,27 @@ class Sm107BlockScaledMoeConfig:
             )
         if len(self.epi_flag_batches) != 2:
             raise ValueError("epi_flag_batches requires (FC1, FC2) values.")
-        if max(self.epi_flag_batches) > 4:
-            raise ValueError("Rubin epi_flag_batches values must be <= 4.")
+        if any(
+            type(batch) is not int or not 1 <= batch <= 4
+            for batch in self.epi_flag_batches
+        ):
+            raise ValueError("Rubin epi_flag_batches values must be in [1, 4].")
+        if (
+            type(self.token_in_flag_batch) is not int
+            or not 1 <= self.token_in_flag_batch <= 32
+        ):
+            raise ValueError("token_in_flag_batch must be in [1, 32].")
+        if self.max_sm_count is not None and (
+            type(self.max_sm_count) is not int or self.max_sm_count < cm
+        ):
+            raise ValueError("max_sm_count must accommodate at least one cluster.")
+        if self.gate_up_clamp is not None and (
+            not math.isfinite(self.gate_up_clamp) or self.gate_up_clamp < 0
+        ):
+            raise ValueError("gate_up_clamp must be finite and nonnegative.")
         if self.fc2_tma_stages is not None and not (
-            1 <= self.fc2_tma_stages <= tiler[1] // 64
+            type(self.fc2_tma_stages) is int
+            and 1 <= self.fc2_tma_stages <= tiler[1] // 64
         ):
             raise ValueError(
                 f"fc2_tma_stages must be in [1, {tiler[1] // 64}] for tiler N "
@@ -274,6 +330,12 @@ class Sm107BlockScaledMoeConfig:
     @property
     def experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
+
+    @property
+    def padded_tokens_per_rank(self) -> int:
+        """Physical capacity keeps the router's four-int vector loads in bounds."""
+        multiple = 4 // math.gcd(self.num_topk, 4)
+        return (self.max_tokens_per_rank + multiple - 1) // multiple * multiple
 
     @property
     def sf_vec_size(self) -> int:
@@ -312,12 +374,13 @@ class Sm107BlockScaledSymmBuffer:
         _require_sm107()
         _configure_dsl_arch()
         self.config = config
+        self.device = torch.device("cuda", torch.cuda.current_device())
         cfg = config
 
         kernel = self._build_kernel(cfg)
         self.kernel = kernel
 
-        tokens = cfg.max_tokens_per_rank
+        tokens = cfg.padded_tokens_per_rank
 
         # Staging tensors. Activation / SF / scores are pulled by peer dispatch
         # warps, so they live on the symmetric heap; the routing indices are a
@@ -355,6 +418,16 @@ class Sm107BlockScaledSymmBuffer:
             (max(local_bytes, 1),), dtype=torch.uint8, device="cuda"
         )
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
+        self._pre_reduced_activation = None
+        if not cfg.reduce_topk_in_kernel:
+            region = kernel.token_comm.pre_reduced_activation_region
+            start = workspace.offset(region)
+            end = start + workspace.nbytes(region)
+            self._pre_reduced_activation = (
+                self.shared_workspace[start:end]
+                .view(torch.bfloat16)
+                .view(tokens, cfg.num_topk, cfg.hidden)
+            )
         if (
             self.local_workspace.data_ptr() % 128 != 0
             or self.shared_workspace.data_ptr() % 128 != 0
@@ -370,6 +443,9 @@ class Sm107BlockScaledSymmBuffer:
         self._compiled: Optional[Any] = None
         self._launch_key: Optional[tuple] = None
         self._launch_kwargs: Optional[dict] = None
+        self._launch_weights: Optional[
+            Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
+        ] = None
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
 
@@ -437,7 +513,7 @@ class Sm107BlockScaledSymmBuffer:
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
-                "max_tokens_per_rank": cfg.max_tokens_per_rank,
+                "max_tokens_per_rank": cfg.padded_tokens_per_rank,
                 "apply_topk_at_fc1": cfg.apply_topk_at_fc1,
             }
         )
@@ -520,6 +596,15 @@ class Sm107BlockScaledSymmBuffer:
         """Compile on first use, then launch the fused mega kernel."""
         import cutlass.cute as cute
 
+        if self._destroyed:
+            raise RuntimeError("cannot launch a destroyed SM107 workspace.")
+        if (
+            self.device.type == "cuda"
+            and self.device.index != torch.cuda.current_device()
+        ):
+            raise RuntimeError(
+                "SM107 workspace must launch on the CUDA device that owns it."
+            )
         key = (
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
@@ -528,21 +613,32 @@ class Sm107BlockScaledSymmBuffer:
             torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
-            comm.ensure_not_capturing("SM107 mega kernel compile")
+            if self._compiled is None:
+                comm.ensure_not_capturing("SM107 mega kernel compile")
+            # DLPack metadata binding and stream conversion are host-only.
+            # A warmed workspace may bind another layer or stream in capture.
             kwargs = self._runtime_kwargs(transformed_l1, transformed_l2)
             if self._compiled is None:
                 self._compiled = cute.compile(self.kernel, **kwargs)
             self._launch_key = key
             self._launch_kwargs = kwargs
+            # Keep pointers alive until the cached bindings are replaced.
+            self._launch_weights = (transformed_l1, transformed_l2)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
+        else:
+            # Invalid routes do not write a combine slot. Clear those slots on
+            # every launch so a masked route cannot reuse an earlier result.
+            invalid = (self.topk_idx < 0) | (
+                self.topk_idx >= self.config.num_total_experts
+            )
+            self._pre_reduced_activation.masked_fill_(invalid.unsqueeze(-1), 0)
         self._compiled(**self._launch_kwargs)
 
     def destroy(self) -> None:
         if self._destroyed:
             return
-        self._destroyed = True
         comm.ensure_not_capturing("SM107 mega workspace free")
         # nvshmem free is collective and does not wait for in-flight work;
         # drain this rank's device before releasing symmetric memory that a
@@ -550,10 +646,17 @@ class Sm107BlockScaledSymmBuffer:
         torch.cuda.synchronize()
         self._compiled = None
         self._launch_kwargs = None
+        self._launch_weights = None
+        self._pre_reduced_activation = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
             comm.free_sym_tensor(getattr(self, name, None))
+            setattr(self, name, None)
         if self.config.reduce_topk_in_kernel:
             comm.free_sym_tensor(self.output_activation)
+        self.output_activation = None
+        self.local_workspace = None
+        self.topk_idx = None
+        self._destroyed = True
 
 
 def get_symm_buffer_for_sm107_block_scaled_mega_moe(
@@ -641,18 +744,39 @@ def _validate_weight_leg(
     leg: TransformedBlockScaledWeights,
     expected_weight_shape: Tuple[int, ...],
     expected_sf_numel: int,
+    cfg: Sm107BlockScaledMoeConfig,
+    device: torch.device,
 ) -> None:
+    if (
+        not isinstance(leg, tuple)
+        or len(leg) != 2
+        or not all(isinstance(t, torch.Tensor) for t in leg)
+    ):
+        raise ValueError(f"{name} must be a (weight, scale) tensor pair.")
     weight, scale = leg
     if tuple(weight.shape) != expected_weight_shape:
         raise ValueError(
             f"{name} weight shape {tuple(weight.shape)} != expected "
             f"{expected_weight_shape}."
         )
-    if scale.numel() != expected_sf_numel * expected_weight_shape[0]:
+    if tuple(scale.shape) != (expected_weight_shape[0], expected_sf_numel):
         raise ValueError(
             f"{name} scale numel {scale.numel()} != expected "
             f"{expected_sf_numel * expected_weight_shape[0]}."
         )
+    if (
+        weight.dtype != cfg.torch_act_data_dtype
+        or scale.dtype != cfg.torch_act_sf_dtype
+    ):
+        raise ValueError(
+            f"{name} requires {cfg.torch_act_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
+        )
+    if not weight.permute(0, 2, 1).is_contiguous() or not scale.is_contiguous():
+        raise ValueError(
+            f"{name} requires K-major weights and contiguous scale planes."
+        )
+    if any(t.device != device or t.data_ptr() % 16 for t in leg):
+        raise ValueError(f"{name} must be on {device} with 16-byte aligned storage.")
 
 
 def sm107_block_scaled_mega_moe(
@@ -679,6 +803,15 @@ def sm107_block_scaled_mega_moe(
             stacklevel=2,
         )
     cfg = symm_buffer.config
+    if y is not None and (
+        y.ndim != 2
+        or y.shape[1] != cfg.hidden
+        or y.dtype != torch.bfloat16
+        or y.device != symm_buffer.device
+    ):
+        raise ValueError(
+            f"y must be a BF16 matrix with {cfg.hidden} columns on {symm_buffer.device}."
+        )
     if num_tokens is None:
         num_tokens = int(y.shape[0]) if y is not None else symm_buffer.staged_tokens()
     if num_tokens is None:
@@ -690,19 +823,26 @@ def sm107_block_scaled_mega_moe(
         raise ValueError(
             f"num_tokens ({num_tokens}) out of range [0, {cfg.max_tokens_per_rank}]."
         )
+    if y is not None and y.shape[0] < num_tokens:
+        raise ValueError("y does not have enough rows for num_tokens.")
 
     fc1_shape, fc2_shape, fc1_sf, fc2_sf = _expected_weight_shapes(cfg)
-    _validate_weight_leg("fc1", transformed_l1, fc1_shape, fc1_sf)
-    _validate_weight_leg("fc2", transformed_l2, fc2_shape, fc2_sf)
+    _validate_weight_leg(
+        "fc1", transformed_l1, fc1_shape, fc1_sf, cfg, symm_buffer.device
+    )
+    _validate_weight_leg(
+        "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
+    )
 
     symm_buffer.launch(transformed_l1, transformed_l2)
-    if sync:
-        torch.cuda.synchronize()
-
     out = symm_buffer.output_activation[:num_tokens]
     if y is None:
+        if sync:
+            torch.cuda.synchronize()
         return out
     y[:num_tokens].copy_(out)
+    if sync:
+        torch.cuda.synchronize()
     return None
 
 
@@ -712,6 +852,14 @@ def sm107_block_scaled_mega_launch_thunk(
     symm_buffer: Sm107BlockScaledSymmBuffer,
 ):
     """Zero-arg relauncher over pre-staged inputs, for steady-state timing loops."""
+    cfg = symm_buffer.config
+    fc1_shape, fc2_shape, fc1_sf, fc2_sf = _expected_weight_shapes(cfg)
+    _validate_weight_leg(
+        "fc1", transformed_l1, fc1_shape, fc1_sf, cfg, symm_buffer.device
+    )
+    _validate_weight_leg(
+        "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
+    )
 
     def _thunk() -> None:
         symm_buffer.launch(transformed_l1, transformed_l2)

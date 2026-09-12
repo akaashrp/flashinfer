@@ -45,13 +45,16 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     import torch
 
     from .....weights import MoEWeightPack
+    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+        concatenate_block_scaled_weights,
+    )
 
     weights_mod = _backend_module(quant_kind, "weights")
     extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
-    fc1_parts, fc1_sf_parts, fc2_parts, fc2_sf_parts = [], [], [], []
+    fc1_parts, fc2_parts = [], []
     for begin in range(0, experts_per_rank, _WEIGHT_CHUNK_EXPERTS):
         count = min(_WEIGHT_CHUNK_EXPERTS, experts_per_rank - begin)
         w13 = (
@@ -82,15 +85,13 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
             hidden_size=args.hidden,
             **extra,
         )
-        fc1_parts.append(fc1_w)
-        fc1_sf_parts.append(fc1_sf.reshape(count, -1))
-        fc2_parts.append(fc2_w)
-        fc2_sf_parts.append(fc2_sf.reshape(count, -1))
+        fc1_parts.append((fc1_w, fc1_sf.reshape(count, -1)))
+        fc2_parts.append((fc2_w, fc2_sf.reshape(count, -1)))
         del w13, w2
         torch.cuda.empty_cache()
     return (
-        (torch.cat(fc1_parts), torch.cat(fc1_sf_parts)),
-        (torch.cat(fc2_parts), torch.cat(fc2_sf_parts)),
+        concatenate_block_scaled_weights(fc1_parts),
+        concatenate_block_scaled_weights(fc2_parts),
     )
 
 
@@ -205,6 +206,11 @@ def tune_one(
             candidates,
             autotune_sm107_block_scaled_mega_moe,
         )
+    except BaseException:
+        # A rank-local GPU failure must escape to the job supervisor without
+        # entering collective free while peers may still be running.
+        symm_buffer = None
+        raise
     finally:
         if symm_buffer is not None:
             symm_buffer.destroy()
@@ -219,6 +225,11 @@ def run_tuning(args, quant_kind: str) -> int:
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if os.environ.get("MEGA_NO_DIST") == "1" and world_size != 1:
+        raise SystemExit("MEGA_NO_DIST=1 cannot be used in a multi-rank SM107 job")
+    from .....kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
+
+    require_sm107_dsl()
     runtime = None
     if os.environ.get("MEGA_NO_DIST") == "1" or world_size == 1:
         os.environ.setdefault("MEGA_NO_DIST", "1")
@@ -241,6 +252,9 @@ def run_tuning(args, quant_kind: str) -> int:
         for max_tokens in args.max_tokens:
             tune_one(args, rank, world_size, max_tokens, quant_kind)
         torch.cuda.synchronize()
+    except BaseException:
+        runtime = None
+        raise
     finally:
         if runtime is not None:
             from .....core.runtime import finalize_moe_ep_runtime

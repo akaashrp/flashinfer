@@ -24,15 +24,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-QUANT_KINDS = ("mxfp8_e4m3", "nvfp4")
+QUANT_KINDS = ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4")
 
 
 def _sm107_tree():
-    """Import the drop package, skipping if something shadows ``sources``."""
-    try:
-        import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
-    except RuntimeError as exc:
-        pytest.skip(f"next_cutedsl_megamoe tree unavailable in this process: {exc}")
+    """Import failures on a supported host must fail qualification."""
+    import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
+
     return pkg
 
 
@@ -82,7 +80,7 @@ def _single_rank_problem():
 
 # The nvfp4 wire is much coarser (4-bit data, per-16 fp8 scales through TWO
 # GEMMs); the mxfp8 band matches the previous GLU-kernel test.
-_REL_L2_BAND = {"mxfp8_e4m3": 0.02, "nvfp4": 0.06}
+_REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06}
 
 
 def _backend_modules(quant_kind: str):
@@ -109,8 +107,14 @@ def _quantize_reference_weights(pkg, p, quant_kind: str):
         w13_q, w13_sf = pkg.quantize_nvfp4_block16(w13_interleaved)
         w2_q, w2_sf = pkg.quantize_nvfp4_block16(w2_f32)
     else:
-        w13_q, w13_sf = pkg.quantize_mxfp8_block32(w13_interleaved, torch.float8_e4m3fn)
-        w2_q, w2_sf = pkg.quantize_mxfp8_block32(w2_f32, torch.float8_e4m3fn)
+        w13_q, w13_sf = pkg.quantize_mxfp8_block32(
+            w13_interleaved,
+            (torch.float8_e4m3fn if quant_kind == "mxfp8_e4m3" else torch.float8_e5m2),
+        )
+        w2_q, w2_sf = pkg.quantize_mxfp8_block32(
+            w2_f32,
+            (torch.float8_e4m3fn if quant_kind == "mxfp8_e4m3" else torch.float8_e5m2),
+        )
     return w13_q, w13_sf, w2_q, w2_sf
 
 

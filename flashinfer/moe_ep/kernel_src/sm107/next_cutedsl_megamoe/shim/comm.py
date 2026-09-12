@@ -70,7 +70,7 @@ def sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 
 def free_sym_tensor(tensor: Optional[torch.Tensor]) -> None:
     """Release an NVSHMEM symmetric tensor; no-op for plain-CUDA allocations."""
-    if tensor is None or getattr(tensor, "_mega_plain_alloc", False) or _no_dist():
+    if tensor is None or getattr(tensor, "_mega_plain_alloc", False):
         return
     import nvshmem.core
 
