@@ -45,7 +45,7 @@ below pass, then also test the intended minimum supported combination.
 | Canonical weights | Floating `[E_local, 2I, H]` and `[E_local, H, I]`; canonical gate rows precede up rows |
 | Transformed weights | K-major physical storage, 16-byte aligned, exact typed scale planes; preserve physical layout when concatenating experts |
 | BF16 inputs | `quantize_input=True`; staging quantizes on the caller's stream |
-| Prequantized inputs | Matching data format; exact raw E4M3 scales for NVFP4 or E8M0 scales for MXFP8; uint8 scale storage is interpreted as raw bytes |
+| Prequantized inputs | Matching data format; scales are `[T, H/16]` E4M3 for NVFP4 or `[T, H/32]` E8M0 for MXFP8; uint8 scale storage is interpreted as raw bytes. Pass the logical scale columns, excluding internal workspace communication padding. |
 | Normalization | Unit normalization; `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const` must be omitted |
 | Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores; repeated masked slots are allowed |
 | Output | BF16; owned tensor by default; workspace views expire on the next workspace use or destruction |
@@ -78,6 +78,31 @@ staging kernel is a performance follow-up; measure the Torch fallback.
 
 ## Required correctness and lifecycle runs
 
+The existing `tests/moe_ep/run_tests.sh` targets from PR #4601 remain the
+direct entry points for native Rubin testing. From the repository root,
+with the Rubin environment active:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+bash tests/moe_ep/run_tests.sh oracle_sm107
+NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107
+```
+
+`oracle_sm107` runs the single-GPU Torch-oracle file and the added kernel
+boundary file with `MEGA_NO_DIST=1`. `mega_sm107` runs the distributed
+`MoEEpLayer` tests through `torchrun`; it defaults to four ranks, and
+`NPROC_MULTIRANK=2` or `8` selects the other supported qualification sizes.
+Both targets now cover NVFP4, MXFP8 E4M3, and MXFP8 E5M2. Ensure `python`
+and `torchrun` resolve to the intended environment; the shell runner also
+accepts `PYTHON` and `TORCHRUN` executable overrides.
+
+These targets are convenient first runs for bring-up and debugging. For
+upstream qualification evidence, use the strict runner below. Its `single`
+and `multi` suites invoke pytest over the same native test files, while
+`--suite all` also includes the host/portable regressions. A successful
+strict run covers those native files; repeating the direct shell runs is
+not a separate acceptance requirement.
+
 Use separate result directories and retain every rank's logs. The strict
 runner checks hardware and compiler prerequisites, rejects every skipped
 test and an empty selection, makes OOMs fail, and kills the entire child
@@ -90,6 +115,17 @@ python tests/moe_ep/qualify_sm107.py --suite all --world-size 2 --output-dir /tm
 python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 --output-dir /tmp/sm107-ep4
 python tests/moe_ep/qualify_sm107.py --suite all --world-size 8 --output-dir /tmp/sm107-ep8
 ```
+
+The shell runner also exposes the strict `--suite all` command:
+
+```bash
+NPROC_MULTIRANK=4 SM107_RESULTS_DIR=/tmp/sm107-ep4 \
+  bash tests/moe_ep/run_tests.sh qualify_sm107
+```
+
+This is an alternative to the corresponding Python command, not an
+additional suite. Use the Python command to select individual suites,
+sanitizers, or installed-package testing.
 
 Use `--suite single` on a one-GPU Rubin host. If EP8 hardware is unavailable,
 state that limitation and bound the claimed support to the configurations

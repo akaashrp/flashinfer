@@ -171,7 +171,10 @@ def test_layer_prequantized_input_and_output_view(monkeypatch, kind, raw_scale_b
         )
         expected = eager.forward(t)
         xq = eager._workspace.x[:8].clone()
-        sf = eager._workspace.x_sf[:8].clone()
+        # Public inputs contain logical scale columns; x_sf also includes
+        # private communication padding that is not part of that contract.
+        sf_cols = fp.token_hidden_size // (16 if kind == "nvfp4" else 32)
+        sf = eager._workspace.x_sf[:8, :sf_cols].clone()
         prestaged = MoEEpLayer(
             bootstrap=bootstrap,
             fleet_params=fp,
