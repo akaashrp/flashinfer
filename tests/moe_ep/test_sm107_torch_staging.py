@@ -123,6 +123,34 @@ def test_prequantized_metadata_rejects_wrong_encoding_and_oversized_scales(kind)
         validate(topk_weights=weights.cpu())
 
 
+def test_fp4_pack_unpack_graph_replay():
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        pack_f32_to_fp4,
+        unpack_fp4_to_f32,
+    )
+
+    # Exercise every packed byte, including both signs and signed zero.
+    raw = torch.arange(256, dtype=torch.uint8).reshape(16, 16)
+    expected = unpack_fp4_to_f32(raw)
+    staged = raw.cuda()
+
+    def roundtrip():
+        return unpack_fp4_to_f32(pack_f32_to_fp4(unpack_fp4_to_f32(staged)))
+
+    roundtrip()  # The public layer also warms up before graph capture.
+    torch.cuda.synchronize()
+    graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=stream):
+        output = roundtrip()
+    for shift in (0, 1, 7):
+        staged.copy_(raw.roll(shift, dims=0))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output, expected.roll(shift, dims=0).cuda(), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (

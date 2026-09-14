@@ -24,6 +24,7 @@ in the shim.  Semantics mirror the harness:
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -41,6 +42,14 @@ _FP8_MAX = {
 _E2M1_MAX = 6.0
 # All positive E2M1 code values (sign handled separately).
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+@cache
+def _get_e2m1_values(device: torch.device) -> torch.Tensor:
+    # Eager preprocessing/warmup initializes this immutable table per device.
+    # Reuse it during capture: constructing it from a Python tuple on every
+    # call would perform an unsupported unpinned CPU-to-CUDA copy.
+    return torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=device)
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -108,7 +117,7 @@ def pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     """
     if fp32.shape[-1] % 2 != 0:
         raise ValueError(f"FP4 pack needs an even trailing dim, got {fp32.shape[-1]}.")
-    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=fp32.device)
+    values = _get_e2m1_values(fp32.device)
     magnitude = torch.nan_to_num(fp32, nan=0.0).abs().clamp(max=_E2M1_MAX)
     distance = (magnitude.unsqueeze(-1) - values).abs()
     # Ties-to-even: among the (at most two, adjacent) codes at the minimum
@@ -131,7 +140,7 @@ def pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
 def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
     """Nibble-packed E2M1 (uint8 / float4_e2m1fn_x2) -> fp32, trailing dim doubled."""
     raw = packed.view(torch.uint8)
-    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=raw.device)
+    values = _get_e2m1_values(raw.device)
     low = raw & 0x0F
     high = raw >> 4
     nibbles = torch.stack((low, high), dim=-1).reshape(*raw.shape[:-1], -1)
