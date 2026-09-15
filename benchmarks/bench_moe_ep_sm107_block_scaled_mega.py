@@ -1,9 +1,10 @@
 """Native SM107 MegaMoE kernel and MoEEpLayer.forward latency benchmark.
 
-Use --mode kernel|forward and --execution eager|graph to select the span.
+Use --mode kernel|compute|forward and --execution eager|graph to select the span.
 The primary metric is p50 of per-iteration maximum rank latency; JSONL
-preserves every sample, resolved knobs, shape, seed, environment, accuracy,
-and memory. A sampled Torch oracle gates every result.
+also reports rank-zero p50 for historical comparisons and preserves every
+sample, timing/cache protocol, resolved knobs, shape, seed, environment,
+accuracy, and memory. A sampled Torch oracle gates every result.
 
 Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
     torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \\
@@ -33,6 +34,7 @@ NUM_EXPERTS = 384
 TOP_K = 6
 WEIGHT_CHUNK_EXPERTS = 8  # bf16 generation + quantize peak-memory bound
 SEED = 20260817
+L2_FLUSH_BYTES = 300 * 1024 * 1024
 
 # Upstream selected-best knobs per (routing, tokens/rank). Every winner uses
 # mixed CGA (preferred 4x1, fallback 2x1), phase-interleave scheduling, atomic
@@ -171,17 +173,43 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
     )
 
 
-def _l2_flush() -> None:
-    """Upstream tester/host_utils.l2_flush: a fresh 300MB fp32 randn on the
-    current stream evicts the caches; enqueued before the start event so it
-    falls outside the timing window."""
-    _ = torch.randn(300 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")
+def _l2_flush(buffer: torch.Tensor) -> None:
+    """Reuse the random-write flush buffer outside the CUDA-event window."""
+    torch.randn(buffer.shape, out=buffer)
+
+
+def _timing_protocol(args):
+    """Describe the measured work separately from cache and launch scheduling."""
+    owned_output = args.mode != "kernel"
+    return dict(
+        timing_method="cuda_event",
+        timed_span={
+            "kernel": "prestaged_kernel_reset_reduce",
+            "compute": "prestaged_backend_compute_and_output_copy",
+            "forward": "bf16_public_forward",
+        }[args.mode],
+        timing_scope="gpu_graph_replay" if args.execution == "graph" else "gpu_stream",
+        host_wall_time_measured=False,
+        input_staging_in_timed_span=args.mode == "forward",
+        output_ownership="owned" if owned_output else "workspace_view",
+        output_allocation=(
+            "during_capture" if args.execution == "graph" else "per_call"
+        )
+        if owned_output
+        else "none",
+        synchronization="barrier_before_batch_no_inter_iteration_sync",
+        cache_policy="consecutive_launches" if args.no_l2_flush else "l2_flushed",
+        l2_flush_bytes=0 if args.no_l2_flush else L2_FLUSH_BYTES,
+        l2_flush_method="none" if args.no_l2_flush else "preallocated_fp32_randn",
+        graph_replay_warmup=args.warmup if args.execution == "graph" else 0,
+    )
 
 
 def _summarize_samples(per_rank):
     """Collective latency is the slowest rank in each matched iteration."""
     maxima = [max(samples) for samples in zip(*per_rank, strict=True)]
     return {
+        "p50_rank0_us": statistics.median(per_rank[0]),
         "p50_max_rank_us": statistics.median(maxima),
         "p95_max_rank_us": sorted(maxima)[max(0, math.ceil(0.95 * len(maxima)) - 1)],
         "mean_max_rank_us": statistics.mean(maxima),
@@ -233,7 +261,9 @@ def _selected_knobs(pkg, policy, tokens, capacity, routing, quant_kind, world):
     )
 
 
-def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_kind):
+def _bench_one(
+    rank, world, tokens, capacity, routing, transformed, args, quant_kind, flush_buffer
+):
     import dataclasses
 
     import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
@@ -279,11 +309,27 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         indices, expected = pkg.sampled_reference(
             layer._workspace, *transformed, tokens
         )
-        invoke = (
-            pkg.sm107_block_scaled_mega_launch_thunk(*transformed, layer._workspace)
-            if args.mode == "kernel"
-            else lambda: layer.forward(tensors)
-        )
+        if args.mode == "kernel":
+            invoke = pkg.sm107_block_scaled_mega_launch_thunk(
+                *transformed, layer._workspace
+            )
+        elif args.mode == "compute":
+
+            def invoke():
+                # Inputs stay staged from the initial public forward. Match
+                # owned-output semantics, including allocation before compute.
+                output = torch.empty(
+                    (tokens, HIDDEN), dtype=torch.bfloat16, device=x.device
+                )
+                return layer._kernel.compute(
+                    layer._workspace, transformed, output=output
+                )
+
+        else:
+
+            def invoke():
+                return layer.forward(tensors)
+
         torch.cuda.synchronize()
         for _ in range(args.warmup):
             invoke()
@@ -292,24 +338,34 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                invoke()
+                graph_output = invoke()
             invoke = graph.replay
+            # Warm up graph replay itself so upload/first-replay effects are
+            # excluded along with compilation and capture.
+            for _ in range(args.warmup):
+                invoke()
+            torch.cuda.synchronize()
         dist.barrier()
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         stops = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         for i in range(args.iters):
-            if not args.no_l2_flush:
-                _l2_flush()
+            if flush_buffer is not None:
+                _l2_flush(flush_buffer)
             starts[i].record()
-            invoke()
+            output = invoke()
             stops[i].record()
         torch.cuda.synchronize()
         samples = [
             a.elapsed_time(b) * 1000.0 for a, b in zip(starts, stops, strict=False)
         ]
-        error = pkg.output_error(
-            layer._workspace.output_activation[:tokens], indices, expected
+        observed = (
+            layer._workspace.output_activation[:tokens]
+            if args.mode == "kernel"
+            else graph_output
+            if args.execution == "graph"
+            else output
         )
+        error = pkg.output_error(observed, indices, expected)
         error_tensor = torch.tensor(error, device="cuda", dtype=torch.float64)
         dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
         if float(error_tensor) > (0.06 if quant_kind == "nvfp4" else 0.02):
@@ -321,10 +377,12 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             topk_idx.flatten().long(), minlength=NUM_EXPERTS
         ).float()
         result = dict(
+            schema_version=2,
             rank=rank,
             routing=routing,
             alpha=args.alpha,
             seed=SEED,
+            repetition=args.repetition,
             quant_kind=quant_kind,
             tokens=tokens,
             capacity=capacity,
@@ -338,6 +396,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             l2_flush=not args.no_l2_flush,
             warmup=args.warmup,
             iterations=args.iters,
+            timing_protocol=_timing_protocol(args),
             knob_policy=args.knobs,
             resolved_config=dataclasses.asdict(workspace.config),
             relative_l2_max_rank=float(error_tensor),
@@ -360,7 +419,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             },
         )
         if args.execution == "graph":
-            del invoke, graph
+            del observed, graph_output, invoke, graph
     except BaseException:
         # Failure is fatal to the distributed job. Do not enter a collective
         # free while a peer might be stuck in a kernel or have a CUDA fault.
@@ -412,6 +471,9 @@ def _environment():
                 "CUTE_DSL_ARCH",
                 "NVSHMEM_SYMMETRIC_SIZE",
                 "NVSHMEM_DISABLE_NVLS",
+                "NVSHMEM_REMOTE_TRANSPORT",
+                "NVSHMEM_DISABLE_P2P",
+                "FLASHINFER_MOE_EP_KNOB_CACHE",
                 "CUDA_VISIBLE_DEVICES",
             )
         },
@@ -438,7 +500,9 @@ def main():
         default="nvfp4",
         choices=["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "both", "all"],
     )
-    parser.add_argument("--mode", choices=["kernel", "forward"], default="kernel")
+    parser.add_argument(
+        "--mode", choices=["kernel", "compute", "forward"], default="kernel"
+    )
     parser.add_argument("--execution", choices=["eager", "graph"], default="eager")
     parser.add_argument(
         "--knobs",
@@ -450,8 +514,11 @@ def main():
         "--routing", default="balanced", choices=["balanced", "power_law", "both"]
     )
     parser.add_argument("--alpha", type=float, default=0.8)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--repetition", type=int, default=1, help="label an independent fixed-seed run"
+    )
     parser.add_argument("--output", default="bench_sm107_mega_results.jsonl")
     args = parser.parse_args()
     HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
@@ -462,8 +529,8 @@ def main():
         args.seed,
     )
     token_list = [int(t) for t in args.tokens.split(",")]
-    if min(token_list) < 1 or args.warmup < 1 or args.iters < 1:
-        parser.error("tokens, warmup, and iters must be positive")
+    if min(token_list) < 1 or min(args.warmup, args.iters, args.repetition) < 1:
+        parser.error("tokens, warmup, iters, and repetition must be positive")
     if args.capacity is not None and args.capacity < max(token_list):
         parser.error("--capacity must cover every live token count")
     rank, world = (
@@ -505,6 +572,13 @@ def main():
     )
     environment = _environment()
     try:
+        # One buffer per rank/process, reused across every timed point. The
+        # random writes run before each start event; allocation never does.
+        flush_buffer = (
+            None
+            if args.no_l2_flush
+            else torch.empty(L2_FLUSH_BYTES // 4, dtype=torch.float32, device="cuda")
+        )
         for kind in kinds:
             torch.cuda.reset_peak_memory_stats()
             start = time.perf_counter()
@@ -526,6 +600,7 @@ def main():
                         transformed,
                         args,
                         kind,
+                        flush_buffer,
                     )
                     local = dict(
                         result=result,
@@ -554,7 +629,9 @@ def main():
                         print(
                             f"{kind} EP{world} {routing} T={tokens}/{args.capacity or tokens} "
                             f"{args.mode}/{args.execution}: p50(max rank)={summary['p50_max_rank_us']:.2f} us, "
-                            f"p95={summary['p95_max_rank_us']:.2f} us, rel_l2={result['relative_l2_max_rank']:.5f}",
+                            f"p95={summary['p95_max_rank_us']:.2f} us, "
+                            f"p50(rank 0)={summary['p50_rank0_us']:.2f} us, "
+                            f"rel_l2={result['relative_l2_max_rank']:.5f}",
                             flush=True,
                         )
                     dist.barrier()

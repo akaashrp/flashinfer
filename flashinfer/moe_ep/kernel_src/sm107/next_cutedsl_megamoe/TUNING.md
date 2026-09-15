@@ -13,17 +13,39 @@ compiler and retain absolute measurements.
 
 - `--mode kernel`: a launch over already staged inputs, including the
   required output/reset operations and dispatch, both GEMMs, and combine.
-- `--mode forward`: `MoEEpLayer.forward()`, including validation, Torch
-  quantization/staging, output allocation/copy, and the kernel.
+- `--mode compute`: inputs staged once, then backend `compute()` with a
+  freshly allocated owned output. Includes the backend wrapper, required
+  resets/reduction, kernel, and output copy, but no recurring input staging.
+- `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
+  validation, Torch quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 
-CUDA events delimit the chosen span. The optional L2 flush runs outside
-each event window; `--no-l2-flush` measures consecutive launches without
-that separation. The primary statistic is the median of the maximum rank
-latency in each matched iteration, with p95 also reported. JSONL preserves
+CUDA events measure the GPU stream interval, not host wall-clock latency.
+Eager intervals can include device idle gaps while the host enqueues work.
+For eager `compute`/`forward`, allocation happens on each call; for graphs,
+Python validation and output allocation happen during capture and are not
+repeated by replay. Graph capture and initial replay warmup are outside timing.
+The `timing_protocol` record states the input-staging boundary, output
+ownership/allocation, GPU timing scope, and number of replay warmups.
+
+Cache policy is independent of synchronization. The default L2-flushed series
+rewrites a 300 MiB FP32 buffer before each start event. The buffer is allocated
+once per rank/process and reused across points. `--no-l2-flush` selects
+consecutive launches without those writes. Both series use a barrier before
+the timed batch and no inter-iteration barriers or host synchronization. A
+barrier before every iteration would instead measure a different, from-idle
+protocol. Match that policy as well as the cache policy on both sides of a
+comparison. Flush memory is included in PyTorch allocator measurements.
+
+The primary statistic is the median of the maximum rank duration in each
+matched iteration (`p50_max_rank_us`), with `p95_max_rank_us` also reported.
+`p50_rank0_us` provides a separate compatibility column for historical
+rank-zero reports; it is not interchangeable with the maximum-rank metric.
+These are durations from each rank's local CUDA events, not a synchronized
+cross-device wall-clock timestamp. Schema-version-2 JSONL preserves
 every rank's samples, the per-iteration maxima, full resolved configuration,
-geometry, live/capacity counts, routing seed/load ratio, software versions,
+geometry, live/capacity counts, seed and repetition, software versions,
 repository status, preprocessing time, PyTorch peak memory, and workspace
 sizes. PyTorch allocator peaks do not account for all external NVSHMEM heap
 allocations; inspect the workspace sizes and NVSHMEM heap configuration too.
@@ -40,6 +62,12 @@ controls live rows; `--capacity` fixes a larger workspace capacity.
 `--seed` controls weight and routing generation. `--quant-kind all`
 selects all three formats; `both` retains NVFP4 plus E4M3.
 
+Defaults are 20 warmups and 100 timed iterations. Run three fresh processes
+with the same seed, labeling them `--repetition 1`, `2`, and `3`, to check
+repeatability. This flag labels a run; it does not launch repetitions. Change
+seeds in a separate routing-variation experiment, and increase iterations or
+repetitions if the variability does not resolve the claimed difference.
+
 ## Knob policies
 
 `--knobs default` uses the public backend defaults (also the benchmark
@@ -54,29 +82,39 @@ Engine configuration has the same distinction: `knobs=None` preserves
 explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
 and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
 
-## Required benchmark matrix
+## Qualification workload selection
 
 On the same idle node and pinned environment, measure EP2, EP4, and EP8 where
 claimed; T=1, 16, 128, 512, 1024, 2048, 4096, 8192, 16384, and 32768;
 all formats; balanced and power-law routing; default and tuned knobs;
 kernel and full-forward spans; eager and graph execution. Include small
-live batches in a 32768-row capacity. Use at least five routing seeds for
-imbalanced cases and save each run independently. Report p50/p95 absolute
-latency and memory; establish acceptable regression margins with maintainers
-before selecting results.
+live batches in a 32768-row capacity. The original PR shape is the first
+workload; H7168/I2048/E256/K8 connects to the canonical Blackwell campaign.
+Use additional routing seeds on representative imbalanced cases after the
+fixed-seed repetitions. Save each run independently. This is an audit
+recommendation, not a repository-wide mandatory cross-product. Agree the
+workloads and regression margins for the intended support claim, and report
+absolute p50/p95 latency and memory.
 
-For example, run both commands for each `mode`, policy, and execution mode:
+For example, choose a persistent results directory outside a small home
+quota, and run a steady-state series plus a separately labeled flushed series:
 
 ```bash
 export CUTE_DSL_ARCH=sm_107a
-torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
-  --quant-kind all --routing both --tokens 1,16,128,512,1024,2048,4096,8192,16384,32768 \
-  --mode kernel --execution eager --knobs default --iters 50 \
-  --output /tmp/sm107-ep4-default-kernel.jsonl
-torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
-  --quant-kind all --routing both --tokens 1,16,128,512,1024 --capacity 32768 \
-  --mode forward --execution graph --knobs cache --iters 50 \
-  --output /tmp/sm107-ep4-cache-forward-graph.jsonl
+: "${FI_RESULTS:?Set a fresh persistent results directory}"
+mkdir -p "$FI_RESULTS"
+for fi_repeat in 1 2 3; do
+  torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+    --quant-kind all --routing both --tokens 1,16,128,512,1024 --capacity 32768 \
+    --mode forward --execution graph --knobs default --no-l2-flush \
+    --warmup 20 --iters 100 --seed 0 --repetition "$fi_repeat" \
+    --output "$FI_RESULTS/ep4-forward-graph-consecutive-repeat$fi_repeat.jsonl"
+  torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+    --quant-kind all --routing both --tokens 1024,2048,4096,8192,16384,32768 \
+    --mode kernel --execution eager --knobs default \
+    --warmup 20 --iters 100 --seed 0 --repetition "$fi_repeat" \
+    --output "$FI_RESULTS/ep4-kernel-eager-flushed-repeat$fi_repeat.jsonl"
+done
 ```
 
 These runs generate and transform weights before timing. The row-chunked
@@ -86,8 +124,16 @@ evaluating model-load memory; chunked synthetic generation alone does not
 represent retaining all canonical weights during conversion.
 
 Compare changes by running the same harness, geometry, seed, topology,
-clocks, software, and measurement mode at both revisions. The harness does
-not print ratios against old hard-coded internal latencies. Report the
+clocks, software, warmup/sample counts, output semantics, synchronization,
+cache policy, and measurement mode at both revisions. Blackwell regression
+means base versus candidate on the same SM100 node; Rubin performance means
+candidate versus a qualified baseline on the same SM107 node. Historical
+Blackwell microbenchmarks report rank-zero median and prestage inputs even in
+their `e2e_pipelined` mode. Use the same Blackwell harness on both revisions,
+or match its wrapper/copy/allocation boundary with `--mode compute`; do not
+compare that column directly to BF16 public-forward or maximum-rank latency.
+Do not treat old Blackwell numbers as Rubin acceptance thresholds.
+The harness does not print ratios against hard-coded latencies. Report the
 Torch staging cost explicitly before deciding whether fused staging is a
 merge requirement or a follow-up.
 

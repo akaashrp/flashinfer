@@ -196,12 +196,20 @@ Before merging, the reviewer should have:
 - Native Rubin correctness, sanitizer, lifecycle, graph, and distributed
   logs with no hidden skips or missing claimed configurations.
 - Same-node benchmark results for default/tuned kernel and full-forward
-  paths, and an agreed performance/regression threshold with maintainers.
+  paths, with matched timing/cache/synchronization protocols and fixed-seed
+  repetitions. Preserve both maximum-rank and rank-zero statistics with
+  distinct labels, and agree performance/regression thresholds with maintainers.
 - A CI owner and provisioned runner. The manual
   `.github/workflows/moe-ep-sm107.yml` workflow accepts existing runner labels;
   wire the strict suite into the required PR/nightly matrix once that runner
   and its pinned environment exist. The ordinary `run_tests.sh all` remains
   the Blackwell suite; it does not qualify Rubin.
+
+vLLM/SGLang integration and whole-model serving benchmarks are follow-up
+deployment qualification for this inference-kernel contribution. They are
+required before claiming those engine integrations or serving improvements;
+the FlashInfer API, graph, numerical, and lifecycle checks above remain in
+scope for the kernel submission.
 
 Keep `kernel_src/**/src/` unchanged. Any device-kernel correction required
 by Rubin results must be fixed in the kernel team's source and re-exported,

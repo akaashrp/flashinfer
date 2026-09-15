@@ -19,7 +19,8 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
 )
 
 
-def test_collective_latency_reduces_samples_before_median():
+@pytest.fixture
+def benchmark_module():
     path = (
         Path(__file__).resolve().parents[2]
         / "benchmarks/bench_moe_ep_sm107_block_scaled_mega.py"
@@ -27,10 +28,57 @@ def test_collective_latency_reduces_samples_before_median():
     spec = importlib.util.spec_from_file_location("sm107_benchmark", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    result = module._summarize_samples([[1, 100], [100, 1]])
+    return module
+
+
+def test_collective_latency_reduces_samples_before_median(benchmark_module):
+    result = benchmark_module._summarize_samples([[1, 100], [100, 1]])
     assert result["p50_max_rank_us"] == 100
+    assert result["p95_max_rank_us"] == 100
+    assert result["p50_rank0_us"] == 50.5
     assert result["mean_rank_us"] == 50.5
     assert result["per_rank_samples_us"] == [[1, 100], [100, 1]]
+
+
+@pytest.mark.parametrize(
+    "mode,execution,no_flush,staging,ownership,allocation",
+    [
+        ("kernel", "eager", False, False, "workspace_view", "none"),
+        ("compute", "graph", True, False, "owned", "during_capture"),
+        ("forward", "eager", True, True, "owned", "per_call"),
+        ("forward", "graph", False, True, "owned", "during_capture"),
+    ],
+)
+def test_benchmark_reports_staging_and_capture_allocation(
+    benchmark_module, mode, execution, no_flush, staging, ownership, allocation
+):
+    protocol = benchmark_module._timing_protocol(
+        SimpleNamespace(mode=mode, execution=execution, no_l2_flush=no_flush, warmup=20)
+    )
+    assert protocol["input_staging_in_timed_span"] is staging
+    assert protocol["output_ownership"] == ownership
+    assert protocol["output_allocation"] == allocation
+    assert protocol["host_wall_time_measured"] is False
+    assert protocol["l2_flush_bytes"] == (0 if no_flush else 300 * 1024 * 1024)
+    assert protocol["graph_replay_warmup"] == (20 if execution == "graph" else 0)
+
+
+def test_l2_flush_reuses_storage_during_graph_replay(benchmark_module):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graph replay requires a CUDA device")
+    buffer = torch.empty(4096, device="cuda", dtype=torch.float32)
+    ptr = buffer.data_ptr()
+    benchmark_module._l2_flush(buffer)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        benchmark_module._l2_flush(buffer)
+    graph.replay()
+    first = buffer.clone()
+    graph.replay()
+    assert buffer.data_ptr() == ptr
+    assert torch.isfinite(buffer).all()
+    assert not torch.equal(first, buffer)
 
 
 @pytest.fixture
