@@ -1,14 +1,15 @@
 """Native SM107 MegaMoE kernel and MoEEpLayer.forward latency benchmark.
 
 Use --mode kernel|compute|forward and --execution eager|graph to select the span.
-The primary metric is p50 of per-iteration maximum rank latency; JSONL
-also reports rank-zero p50 for historical comparisons and preserves every
-sample, timing/cache protocol, resolved knobs, shape, seed, environment,
-accuracy, and memory. A sampled Torch oracle gates every result.
+The primary metric is the maximum of per-rank p50 latencies, matching the
+Blackwell autotuner's aggregation. JSONL also reports rank-zero p50,
+preserving every sample, timing/cache
+protocol, resolved knobs, shape, seed, environment, accuracy, and memory.
+A sampled Torch oracle gates every result.
 
 Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
     torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \\
-        --quant-kind all --routing both --mode forward --execution graph
+        --quant-kind all --routing both --mode forward --execution graph --no-l2-flush
 
 See kernel_src/sm107/next_cutedsl_megamoe/TUNING.md for the complete
 qualification matrix and the distinction between default, heuristic,
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import statistics
 import time
@@ -173,14 +173,30 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
     )
 
 
-def _l2_flush(buffer: torch.Tensor) -> None:
-    """Reuse the random-write flush buffer outside the CUDA-event window."""
-    torch.randn(buffer.shape, out=buffer)
+def _l2_flush() -> torch.Tensor:
+    """Match Blackwell's fresh random-write buffer before each start event."""
+    return torch.randn(L2_FLUSH_BYTES // 4, dtype=torch.float32, device="cuda")
+
+
+def _make_compute_call(layer, transformed, x):
+    """Reuse an owned output on already-staged inputs, matching Blackwell."""
+    workspace = layer._workspace
+    output = torch.empty_like(x)
+
+    def invoke():
+        return layer._kernel.compute(workspace, transformed, output=output)
+
+    return invoke
 
 
 def _timing_protocol(args):
     """Describe the measured work separately from cache and launch scheduling."""
-    owned_output = args.mode != "kernel"
+    if args.mode == "kernel":
+        allocation = "none"
+    elif args.mode == "compute":
+        allocation = "before_warmup"
+    else:
+        allocation = "during_capture" if args.execution == "graph" else "per_call"
     return dict(
         timing_method="cuda_event",
         timed_span={
@@ -191,33 +207,24 @@ def _timing_protocol(args):
         timing_scope="gpu_graph_replay" if args.execution == "graph" else "gpu_stream",
         host_wall_time_measured=False,
         input_staging_in_timed_span=args.mode == "forward",
-        output_ownership="owned" if owned_output else "workspace_view",
-        output_allocation=(
-            "during_capture" if args.execution == "graph" else "per_call"
-        )
-        if owned_output
-        else "none",
+        output_ownership="workspace_view" if args.mode == "kernel" else "owned",
+        output_allocation=allocation,
         synchronization="barrier_before_batch_no_inter_iteration_sync",
         cache_policy="consecutive_launches" if args.no_l2_flush else "l2_flushed",
         l2_flush_bytes=0 if args.no_l2_flush else L2_FLUSH_BYTES,
-        l2_flush_method="none" if args.no_l2_flush else "preallocated_fp32_randn",
+        l2_flush_method="none" if args.no_l2_flush else "per_iteration_fp32_randn",
         graph_replay_warmup=args.warmup if args.execution == "graph" else 0,
     )
 
 
 def _summarize_samples(per_rank):
-    """Collective latency is the slowest rank in each matched iteration."""
-    maxima = [max(samples) for samples in zip(*per_rank, strict=True)]
+    """Report the primary and historical medians, retaining raw rank samples."""
+    medians = [statistics.median(samples) for samples in per_rank]
     return {
-        "p50_rank0_us": statistics.median(per_rank[0]),
-        "p50_max_rank_us": statistics.median(maxima),
-        "p95_max_rank_us": sorted(maxima)[max(0, math.ceil(0.95 * len(maxima)) - 1)],
-        "mean_max_rank_us": statistics.mean(maxima),
-        "mean_rank_us": statistics.mean(v for rank in per_rank for v in rank),
-        "min_us": min(v for rank in per_rank for v in rank),
-        "max_us": max(v for rank in per_rank for v in rank),
+        "primary_latency_statistic": "max_rank_p50_us",
+        "max_rank_p50_us": max(medians),
+        "p50_rank0_us": medians[0],
         "per_rank_samples_us": per_rank,
-        "per_iteration_max_rank_us": maxima,
     }
 
 
@@ -261,9 +268,7 @@ def _selected_knobs(pkg, policy, tokens, capacity, routing, quant_kind, world):
     )
 
 
-def _bench_one(
-    rank, world, tokens, capacity, routing, transformed, args, quant_kind, flush_buffer
-):
+def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_kind):
     import dataclasses
 
     import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
@@ -314,17 +319,7 @@ def _bench_one(
                 *transformed, layer._workspace
             )
         elif args.mode == "compute":
-
-            def invoke():
-                # Inputs stay staged from the initial public forward. Match
-                # owned-output semantics, including allocation before compute.
-                output = torch.empty(
-                    (tokens, HIDDEN), dtype=torch.bfloat16, device=x.device
-                )
-                return layer._kernel.compute(
-                    layer._workspace, transformed, output=output
-                )
-
+            invoke = _make_compute_call(layer, transformed, x)
         else:
 
             def invoke():
@@ -349,12 +344,15 @@ def _bench_one(
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         stops = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         for i in range(args.iters):
-            if flush_buffer is not None:
-                _l2_flush(flush_buffer)
+            if not args.no_l2_flush:
+                # Retain the allocation through the launch, as Blackwell does.
+                flush_buffer = _l2_flush()
             starts[i].record()
             output = invoke()
             stops[i].record()
         torch.cuda.synchronize()
+        if not args.no_l2_flush:
+            del flush_buffer
         samples = [
             a.elapsed_time(b) * 1000.0 for a, b in zip(starts, stops, strict=False)
         ]
@@ -377,7 +375,7 @@ def _bench_one(
             topk_idx.flatten().long(), minlength=NUM_EXPERTS
         ).float()
         result = dict(
-            schema_version=2,
+            schema_version=3,
             rank=rank,
             routing=routing,
             alpha=args.alpha,
@@ -515,7 +513,7 @@ def main():
     )
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--repetition", type=int, default=1, help="label an independent fixed-seed run"
     )
@@ -572,13 +570,6 @@ def main():
     )
     environment = _environment()
     try:
-        # One buffer per rank/process, reused across every timed point. The
-        # random writes run before each start event; allocation never does.
-        flush_buffer = (
-            None
-            if args.no_l2_flush
-            else torch.empty(L2_FLUSH_BYTES // 4, dtype=torch.float32, device="cuda")
-        )
         for kind in kinds:
             torch.cuda.reset_peak_memory_stats()
             start = time.perf_counter()
@@ -600,7 +591,6 @@ def main():
                         transformed,
                         args,
                         kind,
-                        flush_buffer,
                     )
                     local = dict(
                         result=result,
@@ -620,7 +610,7 @@ def main():
                             * 6
                             * HIDDEN
                             * INTERMEDIATE
-                            / summary["p50_max_rank_us"]
+                            / summary["max_rank_p50_us"]
                             / 1e6
                         )
                         record = dict(result, **summary, per_rank=gathered)
@@ -628,8 +618,7 @@ def main():
                             stream.write(json.dumps(record) + "\n")
                         print(
                             f"{kind} EP{world} {routing} T={tokens}/{args.capacity or tokens} "
-                            f"{args.mode}/{args.execution}: p50(max rank)={summary['p50_max_rank_us']:.2f} us, "
-                            f"p95={summary['p95_max_rank_us']:.2f} us, "
+                            f"{args.mode}/{args.execution}: max(rank p50)={summary['max_rank_p50_us']:.2f} us, "
                             f"p50(rank 0)={summary['p50_rank0_us']:.2f} us, "
                             f"rel_l2={result['relative_l2_max_rank']:.5f}",
                             flush=True,

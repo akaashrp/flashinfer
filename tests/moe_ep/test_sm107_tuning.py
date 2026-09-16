@@ -31,20 +31,23 @@ def benchmark_module():
     return module
 
 
-def test_collective_latency_reduces_samples_before_median(benchmark_module):
-    result = benchmark_module._summarize_samples([[1, 100], [100, 1]])
-    assert result["p50_max_rank_us"] == 100
-    assert result["p95_max_rank_us"] == 100
-    assert result["p50_rank0_us"] == 50.5
-    assert result["mean_rank_us"] == 50.5
-    assert result["per_rank_samples_us"] == [[1, 100], [100, 1]]
+def test_latency_reports_primary_and_rank0_medians(benchmark_module):
+    # The primary median differs from rank zero and the iteration-max median.
+    result = benchmark_module._summarize_samples([[1, 100], [100, 3]])
+    assert result == {
+        "primary_latency_statistic": "max_rank_p50_us",
+        "max_rank_p50_us": 51.5,
+        "p50_rank0_us": 50.5,
+        "per_rank_samples_us": [[1, 100], [100, 3]],
+    }
 
 
 @pytest.mark.parametrize(
     "mode,execution,no_flush,staging,ownership,allocation",
     [
         ("kernel", "eager", False, False, "workspace_view", "none"),
-        ("compute", "graph", True, False, "owned", "during_capture"),
+        ("compute", "eager", False, False, "owned", "before_warmup"),
+        ("compute", "graph", True, False, "owned", "before_warmup"),
         ("forward", "eager", True, True, "owned", "per_call"),
         ("forward", "graph", False, True, "owned", "during_capture"),
     ],
@@ -60,25 +63,59 @@ def test_benchmark_reports_staging_and_capture_allocation(
     assert protocol["output_allocation"] == allocation
     assert protocol["host_wall_time_measured"] is False
     assert protocol["l2_flush_bytes"] == (0 if no_flush else 300 * 1024 * 1024)
+    assert protocol["l2_flush_method"] == (
+        "none" if no_flush else "per_iteration_fp32_randn"
+    )
     assert protocol["graph_replay_warmup"] == (20 if execution == "graph" else 0)
 
 
-def test_l2_flush_reuses_storage_during_graph_replay(benchmark_module):
-    if not torch.cuda.is_available():
+@pytest.mark.parametrize("execution", ["eager", "graph"])
+def test_compute_reuses_owned_output_with_changing_inputs(benchmark_module, execution):
+    if execution == "graph" and not torch.cuda.is_available():
         pytest.skip("CUDA graph replay requires a CUDA device")
-    buffer = torch.empty(4096, device="cuda", dtype=torch.float32)
-    ptr = buffer.data_ptr()
-    benchmark_module._l2_flush(buffer)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        benchmark_module._l2_flush(buffer)
-    graph.replay()
-    first = buffer.clone()
-    graph.replay()
-    assert buffer.data_ptr() == ptr
-    assert torch.isfinite(buffer).all()
-    assert not torch.equal(first, buffer)
+    device = "cuda" if execution == "graph" else "cpu"
+    x = torch.ones((2, 4), dtype=torch.bfloat16, device=device)
+    workspace = SimpleNamespace(x=x)
+    transformed = object()
+
+    def compute(staged, weights, *, output):
+        assert staged is workspace and weights is transformed
+        output.copy_(staged.x)
+        return output
+
+    layer = SimpleNamespace(
+        _workspace=workspace, _kernel=SimpleNamespace(compute=compute)
+    )
+    invoke = benchmark_module._make_compute_call(layer, transformed, x)
+    output = invoke()
+    assert output.data_ptr() != x.data_ptr()
+    if execution == "graph":
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output = invoke()
+        assert captured_output is output
+        replay = graph.replay
+    else:
+
+        def replay():
+            assert invoke() is output
+
+    for value in (2, 7):
+        x.fill_(value)
+        replay()
+        torch.testing.assert_close(output, x)
+
+
+def test_l2_flush_uses_fresh_storage(benchmark_module, monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("L2 flush requires a CUDA device")
+    monkeypatch.setattr(benchmark_module, "L2_FLUSH_BYTES", 4096)
+    first = benchmark_module._l2_flush()
+    second = benchmark_module._l2_flush()
+    assert first.data_ptr() != second.data_ptr()
+    assert first.numel() * first.element_size() == 4096
+    assert torch.isfinite(first).all() and torch.isfinite(second).all()
 
 
 @pytest.fixture

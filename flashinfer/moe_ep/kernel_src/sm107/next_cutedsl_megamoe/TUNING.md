@@ -14,8 +14,8 @@ compiler and retain absolute measurements.
 - `--mode kernel`: a launch over already staged inputs, including the
   required output/reset operations and dispatch, both GEMMs, and combine.
 - `--mode compute`: inputs staged once, then backend `compute()` with a
-  freshly allocated owned output. Includes the backend wrapper, required
-  resets/reduction, kernel, and output copy, but no recurring input staging.
+  preallocated owned output reused across calls. Includes the backend wrapper,
+  required resets/reduction, kernel, and output copy, but no recurring input staging.
 - `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
   validation, Torch quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
@@ -23,32 +23,43 @@ compiler and retain absolute measurements.
 
 CUDA events measure the GPU stream interval, not host wall-clock latency.
 Eager intervals can include device idle gaps while the host enqueues work.
-For eager `compute`/`forward`, allocation happens on each call; for graphs,
-Python validation and output allocation happen during capture and are not
-repeated by replay. Graph capture and initial replay warmup are outside timing.
+`compute` allocates its output once before warmup and graph capture. Eager
+`forward` allocates on each call; graph `forward` performs Python validation
+and output allocation during capture, outside replay timing. Graph capture
+and initial replay warmup are outside timing.
 The `timing_protocol` record states the input-staging boundary, output
 ownership/allocation, GPU timing scope, and number of replay warmups.
 
 Cache policy is independent of synchronization. The default L2-flushed series
-rewrites a 300 MiB FP32 buffer before each start event. The buffer is allocated
-once per rank/process and reused across points. `--no-l2-flush` selects
-consecutive launches without those writes. Both series use a barrier before
-the timed batch and no inter-iteration barriers or host synchronization. A
+allocates and fills a fresh 300 MiB FP32 buffer before each start event,
+matching the historical Blackwell harness. The buffer stays alive through the
+launch; allocation and random writes are outside the event window.
+`--no-l2-flush` selects consecutive launches without those writes. Both series
+use a barrier before the timed batch and no inter-iteration barriers or host synchronization. A
 barrier before every iteration would instead measure a different, from-idle
 protocol. Match that policy as well as the cache policy on both sides of a
 comparison. Flush memory is included in PyTorch allocator measurements.
 
-The primary statistic is the median of the maximum rank duration in each
-matched iteration (`p50_max_rank_us`), with `p95_max_rank_us` also reported.
-`p50_rank0_us` provides a separate compatibility column for historical
-rank-zero reports; it is not interchangeable with the maximum-rank metric.
+The benchmark reports two latency statistics:
+
+- `max_rank_p50_us`: maximum of each rank's median, matching the Blackwell
+  autotuner's aggregation. This is the primary latency statistic and the
+  denominator of `model_tflops_per_rank`.
+- `p50_rank0_us`: rank-zero median, matching historical Blackwell benchmark tables.
+
+Raw samples remain available for offline tail-latency and variability analysis.
+
 These are durations from each rank's local CUDA events, not a synchronized
-cross-device wall-clock timestamp. Schema-version-2 JSONL preserves
-every rank's samples, the per-iteration maxima, full resolved configuration,
-geometry, live/capacity counts, seed and repetition, software versions,
+cross-device wall-clock timestamp. Schema-version-3 JSONL preserves
+every rank's samples, full resolved
+configuration, geometry, live/capacity counts, seed and repetition, software versions,
 repository status, preprocessing time, PyTorch peak memory, and workspace
 sizes. PyTorch allocator peaks do not account for all external NVSHMEM heap
 allocations; inspect the workspace sizes and NVSHMEM heap configuration too.
+Version 3 adds the maximum of per-rank medians and identifies the primary
+statistic. Version 2 used `p50_max_rank_us` for model TFLOPS, allocated eager
+compute output per call, and reused the flush buffer. Keep those protocols
+separate when comparing old and new records.
 
 Before accepting a result, the harness compares evenly spaced output rows,
 including the first and last, to a collective Torch oracle using the actual
@@ -62,7 +73,7 @@ controls live rows; `--capacity` fixes a larger workspace capacity.
 `--seed` controls weight and routing generation. `--quant-kind all`
 selects all three formats; `both` retains NVFP4 plus E4M3.
 
-Defaults are 20 warmups and 100 timed iterations. Run three fresh processes
+Defaults are 20 warmups and 50 timed iterations. Run three fresh processes
 with the same seed, labeling them `--repetition 1`, `2`, and `3`, to check
 repeatability. This flag labels a run; it does not launch repetitions. Change
 seeds in a separate routing-variation experiment, and increase iterations or
@@ -94,10 +105,12 @@ Use additional routing seeds on representative imbalanced cases after the
 fixed-seed repetitions. Save each run independently. This is an audit
 recommendation, not a repository-wide mandatory cross-product. Agree the
 workloads and regression margins for the intended support claim, and report
-absolute p50/p95 latency and memory.
+absolute median latency, variability across repetitions, and memory.
 
 For example, choose a persistent results directory outside a small home
-quota, and run a steady-state series plus a separately labeled flushed series:
+quota, and run kernel/forward with consecutive launches. The compute comparison
+uses L2 flushing to match Blackwell; no additional flushed kernel/forward
+performance series is planned.
 
 ```bash
 export CUTE_DSL_ARCH=sm_107a
@@ -107,13 +120,13 @@ for fi_repeat in 1 2 3; do
   torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
     --quant-kind all --routing both --tokens 1,16,128,512,1024 --capacity 32768 \
     --mode forward --execution graph --knobs default --no-l2-flush \
-    --warmup 20 --iters 100 --seed 0 --repetition "$fi_repeat" \
+    --warmup 20 --iters 50 --seed 0 --repetition "$fi_repeat" \
     --output "$FI_RESULTS/ep4-forward-graph-consecutive-repeat$fi_repeat.jsonl"
   torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
     --quant-kind all --routing both --tokens 1024,2048,4096,8192,16384,32768 \
-    --mode kernel --execution eager --knobs default \
-    --warmup 20 --iters 100 --seed 0 --repetition "$fi_repeat" \
-    --output "$FI_RESULTS/ep4-kernel-eager-flushed-repeat$fi_repeat.jsonl"
+    --mode kernel --execution eager --knobs default --no-l2-flush \
+    --warmup 20 --iters 50 --seed 0 --repetition "$fi_repeat" \
+    --output "$FI_RESULTS/ep4-kernel-eager-consecutive-repeat$fi_repeat.jsonl"
 done
 ```
 
@@ -129,9 +142,16 @@ cache policy, and measurement mode at both revisions. Blackwell regression
 means base versus candidate on the same SM100 node; Rubin performance means
 candidate versus a qualified baseline on the same SM107 node. Historical
 Blackwell microbenchmarks report rank-zero median and prestage inputs even in
-their `e2e_pipelined` mode. Use the same Blackwell harness on both revisions,
-or match its wrapper/copy/allocation boundary with `--mode compute`; do not
-compare that column directly to BF16 public-forward or maximum-rank latency.
+their `e2e_pipelined` mode. The [linked harness](https://github.com/mhoqueanik/moe_ep_benchmark/blob/ba9f8acb70da21f01d47963ba1f6d365cbe8d139/bench_moe_ep_mega.py)
+reuses its output and flushes L2 on every timed iteration. Match that protocol
+with `--mode compute --execution eager --warmup 20 --iters 50`, leaving L2
+flushing enabled, and compare `p50_rank0_us`. Match geometry, live/capacity
+counts, routing and other conditions too; this protocol does not make unlike
+workloads comparable. Use the same Blackwell harness on both SM100 revisions.
+Rubin's `max_rank_p50_us` now uses the same rank aggregation as the Blackwell
+autotuner. The autotuner times synchronized host wall-clock calls; this
+benchmark uses CUDA events, so matching aggregation alone does not make
+their absolute latencies comparable.
 Do not treat old Blackwell numbers as Rubin acceptance thresholds.
 The harness does not print ratios against hard-coded latencies. Report the
 Torch staging cost explicitly before deciding whether fused staging is a
