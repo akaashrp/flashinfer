@@ -124,6 +124,7 @@ normal activations (seed `7 + rank`, divided by 10) and weights (seed
 chunked conversion to preserve the original RNG sequence. That bank and all
 input generation/preprocessing are outside the timed span. Quantization remains
 backend-specific; the historical and current software stacks must be reported.
+This profile also selects the historical gate/up activation clamp of 10.0.
 The default `rubin` input profile retains the original scaled random fixtures.
 
 Use `compute` / eager with per-iteration L2 flushing, 20 warmups / 50 samples,

@@ -345,6 +345,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         top_k=TOP_K,
         knobs=selection,
         in_kernel_fc2_reduce=args.variant == "ikr",
+        gate_up_clamp=10.0 if args.input_profile == "blackwell" else None,
     )
     cfg = (
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
