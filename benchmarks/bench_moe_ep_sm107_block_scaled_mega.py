@@ -94,23 +94,42 @@ def _topk_idx_power_law(generator, world, tokens, topk, experts, exponent, devic
     return idx.reshape(world, tokens, topk)
 
 
-def _make_routing(world, tokens, routing, alpha):
-    generator = torch.Generator(device="cuda").manual_seed(SEED + tokens)
+def _make_routing(world, tokens, routing, alpha, device="cuda"):
+    if routing == "gaussian":
+        # bench_common.make_problem at moe_ep_benchmark ba9f8acb: independent
+        # rank seeds, unsorted top-k, and the selected scores as routing weights.
+        ids, weights = [], []
+        for rank in range(world):
+            generator = torch.Generator(device=device).manual_seed(SEED + 17 + rank)
+            scores = torch.randn(
+                tokens,
+                NUM_EXPERTS,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            values, indices = torch.topk(scores, TOP_K, dim=-1, sorted=False)
+            ids.append(indices)
+            weights.append(values)
+        return torch.stack(ids).to(torch.int32), torch.stack(weights)
+    generator = torch.Generator(device=device).manual_seed(SEED + tokens)
     if routing == "balanced":
         topk_idx = _topk_idx_balanced(
-            generator, world, tokens, TOP_K, NUM_EXPERTS, "cuda"
+            generator, world, tokens, TOP_K, NUM_EXPERTS, device
         )
     else:
         topk_idx = _topk_idx_power_law(
-            generator, world, tokens, TOP_K, NUM_EXPERTS, alpha, "cuda"
+            generator, world, tokens, TOP_K, NUM_EXPERTS, alpha, device
         )
     topk_weights = (
-        torch.rand((world, tokens, TOP_K), device="cuda", generator=generator) + 0.5
+        torch.rand((world, tokens, TOP_K), device=device, generator=generator) + 0.5
     )
     return topk_idx.to(torch.int32), topk_weights
 
 
-def _local_transformed_weights(rank: int, world: int, quant_kind: str):
+def _local_transformed_weights(
+    rank: int, world: int, quant_kind: str, input_profile: str = "rubin"
+):
     """Random local expert slice, quantized chunk-wise to bound peak memory."""
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
@@ -132,31 +151,65 @@ def _local_transformed_weights(rank: int, world: int, quant_kind: str):
 
     experts_per_rank = NUM_EXPERTS // world
     generator = torch.Generator(device="cuda").manual_seed(SEED + 7 * rank)
+    if input_profile == "blackwell":
+        # Preserve the historical full-bank RNG sequence; conversion still
+        # proceeds in chunks. These allocations are outside the timed span.
+        generator.manual_seed(SEED + 13 + rank)
+        w13_bank = (
+            torch.randn(
+                experts_per_rank,
+                2 * INTERMEDIATE,
+                HIDDEN,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            / 15.0
+        )
+        w2_bank = (
+            torch.randn(
+                experts_per_rank,
+                HIDDEN,
+                INTERMEDIATE,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            / 15.0
+        )
     fc1_parts, fc2_parts = [], []
     for begin in range(0, experts_per_rank, WEIGHT_CHUNK_EXPERTS):
         count = min(WEIGHT_CHUNK_EXPERTS, experts_per_rank - begin)
         w13 = (
-            torch.randn(
-                count,
-                2 * INTERMEDIATE,
-                HIDDEN,
-                device="cuda",
-                dtype=torch.float32,
-                generator=generator,
-            )
-            * HIDDEN**-0.5
-        ).to(torch.bfloat16)
+            w13_bank[begin : begin + count]
+            if input_profile == "blackwell"
+            else (
+                torch.randn(
+                    count,
+                    2 * INTERMEDIATE,
+                    HIDDEN,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                * HIDDEN**-0.5
+            ).to(torch.bfloat16)
+        )
         w2 = (
-            torch.randn(
-                count,
-                HIDDEN,
-                INTERMEDIATE,
-                device="cuda",
-                dtype=torch.float32,
-                generator=generator,
-            )
-            * INTERMEDIATE**-0.5
-        ).to(torch.bfloat16)
+            w2_bank[begin : begin + count]
+            if input_profile == "blackwell"
+            else (
+                torch.randn(
+                    count,
+                    HIDDEN,
+                    INTERMEDIATE,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                * INTERMEDIATE**-0.5
+            ).to(torch.bfloat16)
+        )
         (fc1_w, fc1_sf), (fc2_w, fc2_sf) = weights_mod.preprocess_mega_weights(
             MoEWeightPack(w13=w13, w2=w2),
             intermediate_size=INTERMEDIATE,
@@ -285,7 +338,14 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
     selection = _selected_knobs(
         pkg, args.knobs, tokens, capacity, routing, quant_kind, world
     )
-    common = dict(intermediate_size=INTERMEDIATE, top_k=TOP_K, knobs=selection)
+    if args.variant is not None and isinstance(selection, dict):
+        selection = dict(selection, reduce_topk_in_kernel=args.variant == "ikr")
+    common = dict(
+        intermediate_size=INTERMEDIATE,
+        top_k=TOP_K,
+        knobs=selection,
+        in_kernel_fc2_reduce=args.variant == "ikr",
+    )
     cfg = (
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
         if quant_kind == "nvfp4"
@@ -303,14 +363,31 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         backend=MegaConfig(megakernel=cfg, transformed_weights=transformed),
     )
     try:
-        gen = torch.Generator(device="cuda").manual_seed(SEED + 13 * rank + tokens)
-        x = torch.randn(
-            tokens, HIDDEN, device="cuda", dtype=torch.float32, generator=gen
-        ).bfloat16()
+        if args.input_profile == "blackwell":
+            gen = torch.Generator(device="cuda").manual_seed(SEED + 7 + rank)
+            x = (
+                torch.randn(
+                    tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+                / 10.0
+            )
+        else:
+            gen = torch.Generator(device="cuda").manual_seed(SEED + 13 * rank + tokens)
+            x = torch.randn(
+                tokens, HIDDEN, device="cuda", dtype=torch.float32, generator=gen
+            ).bfloat16()
         topk_idx, topk_weights = _make_routing(world, tokens, routing, args.alpha)
         tensors = MoEEpTensors(x, topk_idx[rank], topk_weights[rank])
         dist.barrier()
         layer.forward(tensors)
+        resolved_variant = (
+            "ikr" if layer._workspace.config.reduce_topk_in_kernel else "bf16"
+        )
+        if args.variant is not None and resolved_variant != args.variant:
+            raise RuntimeError(
+                f"requested variant {args.variant}, but knobs resolved to {resolved_variant}; "
+                "use a matching cache or explicit knobs"
+            )
         indices, expected = pkg.sampled_reference(
             layer._workspace, *transformed, tokens
         )
@@ -382,6 +459,9 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             seed=SEED,
             repetition=args.repetition,
             quant_kind=quant_kind,
+            variant=resolved_variant,
+            combine_dtype="bf16",
+            input_profile=args.input_profile,
             tokens=tokens,
             capacity=capacity,
             hidden=HIDDEN,
@@ -482,7 +562,7 @@ def main():
     global HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokens", default="1024,2048,4096,8192,16384,32768")
+    parser.add_argument("--tokens", default="8,64,512,1024,2048,4096,8192")
     parser.add_argument(
         "--capacity",
         type=int,
@@ -493,6 +573,18 @@ def main():
     parser.add_argument("--num-experts", type=int, default=NUM_EXPERTS)
     parser.add_argument("--topk", type=int, default=TOP_K)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--input-profile",
+        choices=["rubin", "blackwell"],
+        default="rubin",
+        help="blackwell: historical BF16 activation/weight RNG and scales; use --seed 0",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["bf16", "ikr"],
+        help="BF16 combine with separate reduction or in-kernel atomic reduction; "
+        "overrides the reduction knob and verifies the resolved configuration",
+    )
     parser.add_argument(
         "--quant-kind",
         default="nvfp4",
@@ -509,7 +601,9 @@ def main():
     )
     parser.add_argument("--no-l2-flush", action="store_true")
     parser.add_argument(
-        "--routing", default="balanced", choices=["balanced", "power_law", "both"]
+        "--routing",
+        default="gaussian",
+        choices=["gaussian", "balanced", "power_law", "both"],
     )
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--warmup", type=int, default=20)
@@ -519,6 +613,10 @@ def main():
     )
     parser.add_argument("--output", default="bench_sm107_mega_results.jsonl")
     args = parser.parse_args()
+    if args.knobs == "reported" and args.variant == "ikr":
+        parser.error(
+            "reported profiles use separate reduction; do not label an IKR override reported"
+        )
     HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
         args.hidden,
         args.intermediate,
@@ -573,7 +671,9 @@ def main():
         for kind in kinds:
             torch.cuda.reset_peak_memory_stats()
             start = time.perf_counter()
-            transformed = _local_transformed_weights(rank, world, kind)
+            transformed = _local_transformed_weights(
+                rank, world, kind, args.input_profile
+            )
             torch.cuda.synchronize()
             preparation = dict(
                 elapsed_seconds=time.perf_counter() - start,

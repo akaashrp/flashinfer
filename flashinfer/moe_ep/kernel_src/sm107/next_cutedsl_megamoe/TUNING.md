@@ -95,40 +95,68 @@ and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
 
 ## Qualification workload selection
 
-On the same idle node and pinned environment, measure EP2, EP4, and EP8 where
-claimed; T=1, 16, 128, 512, 1024, 2048, 4096, 8192, 16384, and 32768;
-all formats; balanced and power-law routing; default and tuned knobs;
-kernel and full-forward spans; eager and graph execution. Include small
-live batches in a 32768-row capacity. The original PR shape is the first
-workload; H7168/I2048/E256/K8 connects to the canonical Blackwell campaign.
-Use additional routing seeds on representative imbalanced cases after the
-fixed-seed repetitions. Save each run independently. This is an audit
-recommendation, not a repository-wide mandatory cross-product. Agree the
-workloads and regression margins for the intended support claim, and report
-absolute median latency, variability across repetitions, and memory.
+The primary historical Blackwell-table comparison uses EP4, NVFP4 activations
+and weights with BF16 combine, and **both** geometries:
 
-For example, choose a persistent results directory outside a small home
-quota, and run kernel/forward with consecutive launches. The compute comparison
-uses L2 flushing to match Blackwell; no additional flushed kernel/forward
-performance series is planned.
+| Geometry | Hidden | Intermediate | Experts | Top-k |
+| --- | ---: | ---: | ---: | ---: |
+| Main Blackwell table | 7168 | 2048 | 256 | 8 |
+| Original Rubin PR / Blackwell v4-pro table | 7168 | 3072 | 384 | 6 |
+
+Use tokens/rank **8,64,512,1024,2048,4096,8192**, capacity
+`max(64, next_power_of_two(tokens))`, and `--routing gaussian`. This routing
+uses FP32 normal scores, unsorted top-k, and the selected score values as
+weights (not softmax or independent random weights). `--seed 0` matches the
+historical per-rank routing seeds `17 + rank`. `both` still selects the legacy
+balanced and power-law generators for supplementary load-skew experiments.
+
+Run **separate reduction** (`--variant bf16`) and **in-kernel atomic reduction**
+(`--variant ikr`) as distinct variants. Both communicate BF16 partial results;
+IKR is nondeterministic. The variant overrides the reduction setting in explicit
+or heuristic knobs; a cached profile must resolve to the requested variant or
+the benchmark fails. The resolved variant and combine dtype are recorded.
+`--knobs heuristic` selects per-size profiles, matching the policy category of
+the historical table; architecture-specific profiles need not have equal tiles.
+
+`--input-profile blackwell --seed 0` also matches the pinned benchmark's BF16
+normal activations (seed `7 + rank`, divided by 10) and weights (seed
+`13 + rank`, divided by 15). It allocates the canonical weight bank before
+chunked conversion to preserve the original RNG sequence. That bank and all
+input generation/preprocessing are outside the timed span. Quantization remains
+backend-specific; the historical and current software stacks must be reported.
+The default `rubin` input profile retains the original scaled random fixtures.
+
+Use `compute` / eager with per-iteration L2 flushing, 20 warmups / 50 samples,
+three independent process repetitions, and rank-zero median for the historical
+comparison. Kernel/forward characterization uses eager/graph without flushing;
+EP2/8 are scaling experiments, not matches to the historical EP4 table.
+DeepGEMM is excluded from this campaign. Quantized NVFP4/MXFP8 combine paths
+exist in vendored source but their FlashInfer integration is deferred.
+
+Example primary-series invocation (repeat for each geometry, variant and token
+count above, starting a fresh process for each point):
 
 ```bash
 export CUTE_DSL_ARCH=sm_107a
 : "${FI_RESULTS:?Set a fresh persistent results directory}"
 mkdir -p "$FI_RESULTS"
-for fi_repeat in 1 2 3; do
-  torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
-    --quant-kind all --routing both --tokens 1,16,128,512,1024 --capacity 32768 \
-    --mode forward --execution graph --knobs default --no-l2-flush \
-    --warmup 20 --iters 50 --seed 0 --repetition "$fi_repeat" \
-    --output "$FI_RESULTS/ep4-forward-graph-consecutive-repeat$fi_repeat.jsonl"
-  torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
-    --quant-kind all --routing both --tokens 1024,2048,4096,8192,16384,32768 \
-    --mode kernel --execution eager --knobs default --no-l2-flush \
-    --warmup 20 --iters 50 --seed 0 --repetition "$fi_repeat" \
-    --output "$FI_RESULTS/ep4-kernel-eager-consecutive-repeat$fi_repeat.jsonl"
+for fi_variant in bf16 ikr; do
+  for fi_repeat in 1 2 3; do
+    torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+      --hidden 7168 --intermediate 2048 --num-experts 256 --topk 8 \
+      --quant-kind nvfp4 --routing gaussian --input-profile blackwell \
+      --tokens 8 --capacity 64 --variant "$fi_variant" --knobs heuristic \
+      --mode compute --execution eager --warmup 20 --iters 50 --seed 0 \
+      --repetition "$fi_repeat" \
+      --output "$FI_RESULTS/ep4-v3-$fi_variant-t8-repeat$fi_repeat.jsonl"
+  done
 done
 ```
+
+The second geometry's historical table contains only 8/64/512/2048/8192 rows;
+its 1024/4096 Rubin results have no published counterpart in that table.
+Separate supplementary runs can study tuned profiles, other formats,
+fixed-large-capacity decode, balanced/power-law skew, and reported PR knobs.
 
 These runs generate and transform weights before timing. The row-chunked
 preprocessor bounds scratch memory, and expert concatenation preserves
@@ -138,16 +166,16 @@ represent retaining all canonical weights during conversion.
 
 Compare changes by running the same harness, geometry, seed, topology,
 clocks, software, warmup/sample counts, output semantics, synchronization,
-cache policy, and measurement mode at both revisions. Blackwell regression
-means base versus candidate on the same SM100 node; Rubin performance means
-candidate versus a qualified baseline on the same SM107 node. Historical
+cache policy, and measurement mode at both revisions. Same-Rubin performance improvements require a qualified baseline on the same
+SM107 node. Historical cross-architecture comparisons do not isolate hardware
+from software-stack differences. Historical
 Blackwell microbenchmarks report rank-zero median and prestage inputs even in
 their `e2e_pipelined` mode. The [linked harness](https://github.com/mhoqueanik/moe_ep_benchmark/blob/ba9f8acb70da21f01d47963ba1f6d365cbe8d139/bench_moe_ep_mega.py)
 reuses its output and flushes L2 on every timed iteration. Match that protocol
 with `--mode compute --execution eager --warmup 20 --iters 50`, leaving L2
 flushing enabled, and compare `p50_rank0_us`. Match geometry, live/capacity
 counts, routing and other conditions too; this protocol does not make unlike
-workloads comparable. Use the same Blackwell harness on both SM100 revisions.
+workloads comparable. No new Blackwell regression run is part of this campaign.
 Rubin's `max_rank_p50_us` now uses the same rank aggregation as the Blackwell
 autotuner. The autotuner times synchronized host wall-clock calls; this
 benchmark uses CUDA events, so matching aggregation alone does not make

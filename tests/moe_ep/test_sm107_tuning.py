@@ -42,6 +42,35 @@ def test_latency_reports_primary_and_rank0_medians(benchmark_module):
     }
 
 
+def test_gaussian_routing_keeps_selected_scores(benchmark_module, monkeypatch):
+    """Historical routing uses raw scores, including negative selected values."""
+    monkeypatch.setattr(benchmark_module, "SEED", 0)
+    monkeypatch.setattr(benchmark_module, "NUM_EXPERTS", 4)
+    monkeypatch.setattr(benchmark_module, "TOP_K", 2)
+    scores = [
+        torch.tensor([[1.0, -2.0, 3.0, 0.5], [-4.0, -1.0, -3.0, -2.0]]),
+        torch.tensor([[0.0, 5.0, -1.0, 4.0], [7.0, 2.0, 6.0, -3.0]]),
+    ]
+    seeds = []
+
+    def randn(tokens, experts, *, dtype, device, generator):
+        assert (tokens, experts, dtype, device) == (2, 4, torch.float32, "cpu")
+        seeds.append(generator.initial_seed())
+        return scores[len(seeds) - 1]
+
+    monkeypatch.setattr(torch, "randn", randn)
+    ids, weights = benchmark_module._make_routing(2, 2, "gaussian", 0.8, device="cpu")
+    assert seeds == [17, 18]
+    expected_ids = torch.tensor([[[2, 0], [1, 3]], [[1, 3], [0, 2]]])
+    assert ids.dtype == torch.int32
+    # Top-k is unsorted; compare expert sets and each associated raw score.
+    torch.testing.assert_close(ids.long().sort(-1).values, expected_ids.sort(-1).values)
+    for rank in range(2):
+        torch.testing.assert_close(
+            weights[rank], scores[rank].gather(1, ids[rank].long())
+        )
+
+
 @pytest.mark.parametrize(
     "mode,execution,no_flush,staging,ownership,allocation",
     [
