@@ -132,7 +132,7 @@ def lookup_knobs(
     if path is None:
         return None
     key = dict(
-        backend_revision="sm107-block-scaled-v2",
+        backend_revision="sm107-block-scaled-1667b47a-v3",
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
         device=_device_key(device),
@@ -194,7 +194,7 @@ def record_knobs(
     if path is None:
         return None
     entry = dict(
-        backend_revision="sm107-block-scaled-v2",
+        backend_revision="sm107-block-scaled-1667b47a-v3",
         allow_nondeterministic=allow_nondeterministic,
         apply_topk_at_fc1=apply_topk_at_fc1,
         device=_device_key(device),

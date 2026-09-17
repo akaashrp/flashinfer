@@ -16,6 +16,8 @@ from .work_id_claim import (
     AtomicCounterWorkIdState,
     FixedGroupMixedCgaAtomicCounterWorkIdState,
     GridStrideWorkIdState,
+    broadcast_atomic_counter_ready,
+    broadcast_atomic_counter_ready_or_claim,
     claim_work_id,
     initialize_fixed_group_mixed_cga_work_id_state,
 )
@@ -288,6 +290,16 @@ class NonClcMixedCgaSchedulerWorker:
         )
 
     @cute.jit
+    def get_atomic_counter_pointer(self, stream_index: Int32) -> cute.Pointer:
+        """Return one global work-ID counter pointer for read-only observation."""
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError("Work-ID counters are only available in atomic_counter mode.")
+        work_id_state = self._work_id_state
+        if cutlass.const_expr(isinstance(work_id_state, FixedGroupMixedCgaAtomicCounterWorkIdState)):
+            work_id_state = work_id_state.atomic_counter_state
+        return work_id_state.counter_pointer + stream_index
+
+    @cute.jit
     def claim_next_work(self, stream_index=0) -> Int32:
         """Claim the next canonical work ID and update the preferred CTA coordinate."""
         claimed_work_id, self._work_id_state = claim_work_id(self._work_id_state, atomic_counter_index=stream_index)
@@ -303,6 +315,69 @@ class NonClcMixedCgaSchedulerWorker:
         else:
             self.claimed_stream_index = Int32(stream_index)
         return canonical_work_id
+
+    @cute.jit
+    def cluster_uniform_counter_ready(
+        self,
+        counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        ready_is_mask: bool = False,
+    ) -> Boolean:
+        """Return one leader-loaded readiness predicate to every active CTA.
+
+        V1 deliberately excludes fixed fallback groups.  Their several
+        physical clusters must rendezvous for every logical work-ID claim, so
+        independently polling readiness could make group members take
+        different claim paths.  Homogeneous preferred clusters have one shared
+        claim/broadcast channel and therefore one uniform decision.
+        """
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError(
+                "cluster_uniform_counter_ready requires atomic-counter work IDs."
+            )
+        if cutlass.const_expr(self.config.is_mixed):
+            raise NotImplementedError(
+                "cluster-uniform readiness polling does not yet support fixed "
+                "preferred/fallback groups."
+            )
+        ready, self._work_id_state = broadcast_atomic_counter_ready(
+            self._work_id_state,
+            counter_pointer,
+            ready_threshold,
+            ready_is_mask,
+        )
+        return ready
+
+    @cute.jit
+    def cluster_uniform_counter_ready_or_claim(
+        self,
+        ready_counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        claim_stream_index=0,
+        ready_is_mask: bool = False,
+    ) -> Tuple[Boolean, Int32]:
+        """Probe readiness or claim one ID, uniformly across one cluster."""
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError(
+                "cluster_uniform_counter_ready_or_claim requires "
+                "atomic-counter work IDs."
+            )
+        if cutlass.const_expr(self.config.is_mixed):
+            raise NotImplementedError(
+                "fused cluster readiness/claim does not support fixed "
+                "preferred/fallback groups."
+            )
+        ready, claimed_work_id, self._work_id_state = (
+            broadcast_atomic_counter_ready_or_claim(
+                self._work_id_state,
+                ready_counter_pointer,
+                ready_threshold,
+                atomic_counter_index=claim_stream_index,
+                ready_is_mask=ready_is_mask,
+            )
+        )
+        self.claimed_stream_index = Int32(claim_stream_index)
+        return ready, claimed_work_id
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []

@@ -1,5 +1,12 @@
 # SM107 MegaMoE tuning and measurement
 
+The active generic kernel is the `1667b47a` upstream export; see
+[VENDOR.md](VENDOR.md) for the full pin and [SKILL.md](SKILL.md) for refreshes.
+The export also includes GenPhase, but the FlashInfer backend/benchmark does not
+yet select it. SiTU and compressed-combine variants remain separate integration
+work. Historical `92dd334` knob profiles are candidate settings for this newer
+kernel, not new measurements; tuning caches from that drop are invalidated.
+
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
 All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python

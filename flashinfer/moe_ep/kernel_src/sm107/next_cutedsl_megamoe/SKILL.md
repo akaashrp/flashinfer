@@ -8,7 +8,7 @@ export exceptions; [TUNING.md](TUNING.md) covers tuning and measurements.
 
 ```text
 kernel_src/sm107/next_cutedsl_megamoe/
-├── src/sources/            ← kernel-team next/sources/ inference closure
+├── src/sources/            ← immutable output of upstream next/export_src.py
 │   ├── api.py, quant_def.py
 │   ├── helpers/, communication/
 │   └── kernel_src/         ← Rubin inference/mega plus shared dependencies
@@ -27,9 +27,10 @@ kernel_src/sm107/next_cutedsl_megamoe/
 └── TUNING.md               ← tuning and benchmark conventions
 ```
 
-Core principle: **keep `src/` byte-for-byte upstream**, allowing only the
-explicit whole-file export inlines in `VENDOR.md`. Fix device code upstream
-and re-export; put FlashInfer adaptation in `shim/` and the backend wrappers.
+Core principle: **keep `src/` byte-for-byte equal to the pinned upstream export**.
+Record the exporter revision, selected kernels and generated transformations in
+`VENDOR.md`. Fix device/exporter code upstream and re-export; put FlashInfer
+adaptation in `shim/` and the backend wrappers.
 Preserve the vendored-path exclusions in formatting/lint tools.
 
 ## Import layering
@@ -64,36 +65,55 @@ inline sources. If a reference result cites another commit, compare the relevant
 file blobs explicitly; equivalence of `rubin/inference/mega/` alone does not
 establish equivalence of its dependencies or the full repository.
 
-### 2. Reconstruct and copy the inference closure
+### 2. Export the selected kernel closure
 
-Start at `next/sources/kernel_src/rubin/inference/mega/` and follow imports
-through `api.py`, `quant_def.py`, helpers, communication, schedulers and function
-mapping. Include new dependencies and package initializers. Review changed,
-added, moved and deleted files; do not update only files already present.
+Use `next/export_src.py` from the pinned commit. It statically follows dependencies,
+materializes `COPY_FROM_IMPORT` markers, rewrites imports through package
+re-exports and generates a root API for the selected aliases. It does not import
+or execute the device kernels and needs only Python's standard library.
 
-Stage the selected closure outside the installed package, preserving paths
-below `next/sources/`, then copy it to this drop's `src/sources/`. Copy file bytes
-verbatim and remove files no longer in the closure. Retain copyright/license
-headers. Do not copy `.git`, tester/training code, build metadata, caches or
-unrelated kernels. The current 40-file count is an inventory, not a fixed limit.
+From a clean checkout at `FI_VENDOR_SHA`, with an existing scratch staging
+parent and an absent/empty output directory:
 
-Handle `COPY_FROM_IMPORT` markers using the export behavior at the selected
-commit. For the two current exceptions, copy the entire Blackwell target file
-to its Rubin destination using the mapping in `VENDOR.md`. Check the marker's
-target and any relative imports again; do not apply text substitutions or carry
-an inline from a different revision. Record every export exception.
+```bash
+python next/export_src.py --list-kernels
+python next/export_src.py \
+    --kernels RubinInferenceMegaMoE RubinInferenceGenphaseMegaMoE \
+    --dst-dir "${FI_EXPORT_STAGE:?}/sources" > "$FI_EXPORT_STAGE/export.log"
+sha256sum next/export_src.py
+```
 
-### 3. Verify bytes and imports
+The current selection includes the generic and GenPhase inference kernels;
+GenPhase is vendored for a separate FlashInfer integration. Do not select training
+or local fused-routing kernels unless the active task needs those integrations.
+The export may include dependencies from other kernel families; record their
+source mappings rather than manually removing them.
 
-Compare every destination against the corresponding upstream file, using the
-inline mapping where applicable. Preserve the file list and SHA-256 hashes with
-the update evidence. A comparison only against the old FlashInfer drop proves
-absence of local changes, not upstream provenance.
+Review the export before copying it to this drop's `src/sources/`. Replace that
+entire directory with the output, including generated initializers, and remove
+obsolete modules and `__pycache__` entries. Preserve `shim/` and the package API
+outside `src/`. Do not copy `.git`, tester code, build metadata or caches.
 
-AST-walk the vendored files to check relative imports resolve within the closure;
-review absolute/dynamic imports as well. Remove stale `__pycache__` files for
-deleted modules from the development environment. Confirm that raw-kernel
-imports have not escaped `shim/`, and that package import remains lazy.
+Manual closure copying is a fallback when the pinned revision lacks a usable
+exporter, or a concrete exporter defect blocks the requested kernel. Record the
+reason and exact whole-file mappings in `VENDOR.md`; do not hand-patch exported
+source merely to keep the old import paths working. Prefer fixing the exporter
+upstream and re-exporting.
+
+### 3. Verify reproducibility and imports
+
+Run the same exporter/selection into a second empty destination and compare file
+lists and bytes. Compare the installed `src/sources/` against that output and
+preserve SHA-256 hashes with the export log. The current snapshot emits 32 source
+modules, nine initializers, three materialized copies and one rewritten import;
+these counts describe this pin, not a fixed requirement for later versions.
+
+The exporter checks generated syntax, relative import closure and its external-
+module allowlist. Review absolute/dynamic imports and the exporter diff when
+updating versions. Confirm raw-kernel imports remain inside `shim/` and that the
+FlashInfer package stays lazy. Generated intermediate initializers are empty;
+`shim/block_scaled.py` imports the generic kernel through the generated
+`sources.RubinInferenceMegaMoE` alias.
 
 ### 4. Audit construction, workspace and launch contracts
 

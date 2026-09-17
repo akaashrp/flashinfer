@@ -32,6 +32,9 @@ class BlockScaledSwapAbFc12Extension:
     fc1_done_counter_pointer: Pointer
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
+    # Which expert holds each slot the scheduler enumerates. Absent when the
+    # scheduler walks experts directly, in which case a slot is an expert.
+    expert_remap: Optional[cute.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
@@ -44,6 +47,8 @@ class BlockScaledSwapAbFc12Extension:
         values.extend(extract_mlir_values(self.fc2_spin_threshold))
         if self.fc1_ready_counter_pointer is not None:
             values.extend(extract_mlir_values(self.fc1_ready_counter_pointer))
+        if self.expert_remap is not None:
+            values.extend(extract_mlir_values(self.expert_remap))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "BlockScaledSwapAbFc12Extension":
@@ -61,6 +66,7 @@ class BlockScaledSwapAbFc12Extension:
         fc1_ready_counter_pointer = (
             rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
+        expert_remap = rebuild(self.expert_remap) if self.expert_remap is not None else None
         if value_index != len(values):
             raise ValueError(
                 f"BlockScaledSwapAbFc12Extension MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -70,13 +76,26 @@ class BlockScaledSwapAbFc12Extension:
             fc1_done_counter_pointer=fc1_done_counter_pointer,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
+            expert_remap=expert_remap,
         )
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
-        """Pack kernel readiness observations into the published tile flags."""
+        """Pack kernel readiness observations into the published tile flags.
+
+        Also the one place the scheduler's slot becomes an expert index, when the
+        two differ. Translating here rather than at each use is what keeps the
+        remap invisible downstream: every consumer of a published tile -- the
+        weight and scale-factor views, the per-expert alphas, the per-expert
+        scale-factor gate -- addresses an expert. The row offsets the tile carries
+        were resolved in slot order and are already final.
+        """
         phase_and_flags = work_tile.phase_and_flags
+        expert_idx = work_tile.expert_idx
         if work_tile.is_valid_tile:
+            # Inside the validity branch so a terminal tile keeps its sentinel.
+            if cutlass.const_expr(self.expert_remap is not None):
+                expert_idx = self.expert_remap[work_tile.expert_idx]
             counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
             is_fc2 = work_tile.phase == Int32(BlockPhase.Linear2)
@@ -97,7 +116,7 @@ class BlockScaledSwapAbFc12Extension:
                 phase_and_flags = work_tile.phase_and_flags | peek_flag
 
         return SwapAbFc12WorkTileInfo(
-            expert_idx=work_tile.expert_idx,
+            expert_idx=expert_idx,
             tile_m_idx=work_tile.tile_m_idx,
             tile_n_idx=work_tile.tile_n_idx,
             cumulative_data_physical_row=work_tile.cumulative_data_physical_row,

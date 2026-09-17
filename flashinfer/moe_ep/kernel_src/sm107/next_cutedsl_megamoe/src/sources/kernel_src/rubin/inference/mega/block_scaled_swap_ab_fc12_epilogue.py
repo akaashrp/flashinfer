@@ -42,7 +42,8 @@ from .....helpers.ptx_helpers import (
 )
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from ....function_mapping import CoordinateSpace, FunctionMapping
-from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
+from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+from ....schedulers.base import SchedulerConsumer
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 
 
@@ -896,6 +897,10 @@ class SwapABGatedActEpilogue(KernelComponent):
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
+            # SiTU (Kimi K3) selects a different gated-activation core; optional so
+            # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
+            "situ_beta": OptionalRequirement(Optional[float]),
+            "situ_linear_beta": OptionalRequirement(Optional[float]),
         }
 
     @classmethod
@@ -913,6 +918,27 @@ class SwapABGatedActEpilogue(KernelComponent):
             "token_back_push_data": OptionalRequirement(bool),
         }
 
+    @staticmethod
+    def _resolve_situ_betas(problem_desc: ProblemDesc) -> Tuple[Optional[float], Optional[float]]:
+        """Resolve the SiTU (Kimi K3) betas from the ProblemDesc; ``(None, None)`` means SwiGLU.
+
+        Both betas must be given together, and SiTU excludes ``gate_up_clamp`` -- matching DeepGEMM's
+        ``DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value())``. They are baked in at
+        codegen time exactly like ``gate_up_clamp``, so the enclosing KernelClass must also fold them
+        into its ``name()`` cache key.
+        """
+        beta = problem_desc.get("situ_beta")
+        linear_beta = problem_desc.get("situ_linear_beta")
+        if (beta is None) != (linear_beta is None):
+            raise ValueError(f"situ_beta and situ_linear_beta must be set together, got {beta} and {linear_beta}.")
+        if beta is None:
+            return None, None
+        if beta <= 0 or linear_beta <= 0:
+            raise ValueError(f"SiTU beta parameters must be positive, got {beta} and {linear_beta}.")
+        if problem_desc["gate_up_clamp"] is not None:
+            raise ValueError("SiTU does not support gate_up_clamp; the two activation variants are exclusive.")
+        return float(beta), float(linear_beta)
+
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
@@ -922,6 +948,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
+        self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1608,7 +1635,9 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #   2. clamp the DEQUANTED (real) values, gpt-oss ``_apply_gate`` style:
         #        gate = min(gate, +limit)           (upper bound only)
         #        up   = clamp(up, -limit, +limit)   (symmetric)
-        #   3. swiglu:   out = up * gate * sigmoid(gate)
+        #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
+        #        SwiGLU: out = up * gate * sigmoid(gate)
+        #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
         #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
         #
         # The symmetric up-clamp is a single ``min.xorsign.abs.f32`` (magnitude
@@ -1685,14 +1714,50 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                     )
                 )
 
-            # 3) swiglu on the dequanted (and clamped) real values:
-            #    out = up * gate * sigmoid(gate)
-            ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
-            neg_g_log2e = cute.arch.mul_packed_f32x2((g0, g1), neg_log2e_pair)
-            exp_pair = (cute.math.exp2(neg_g_log2e[0], fastmath=True), cute.math.exp2(neg_g_log2e[1], fastmath=True))
-            one_plus_exp = cute.arch.add_packed_f32x2(exp_pair, one_pair)
-            sigmoid_pair = (cute.arch.rcp_approx(one_plus_exp[0]), cute.arch.rcp_approx(one_plus_exp[1]))
-            out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+            # 3) gated activation on the dequanted (and clamped) real values.
+            #    sigmoid(x) = rcp(1 + exp2(-x * log2e)) -- shared by both cores.
+            def _sigmoid(p0, p1):
+                neg = cute.arch.mul_packed_f32x2((p0, p1), neg_log2e_pair)
+                e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
+                d = cute.arch.add_packed_f32x2(e, one_pair)
+                return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+            sigmoid_pair = _sigmoid(g0, g1)
+
+            if cutlass.const_expr(self.situ_beta is None):
+                # SwiGLU: out = up * gate * sigmoid(gate)
+                ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
+                out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
+            else:
+                # SiTU (Kimi K3), matching HF ``modeling_kimi.py``:
+                #     situ_gate = beta        * tanh(gate / beta) * sigmoid(gate)
+                #     situ_up   = linear_beta * tanh(up   / linear_beta)
+                #     out       = situ_gate * situ_up
+                #
+                # ``tanh(z) = 2 * sigmoid(2z) - 1`` keeps the whole core on the packed f32x2 path --
+                # there is no packed tanh, so calling one would force this loop back to scalar.
+                #
+                # beta * tanh(x/beta) = beta * (2*sigmoid(2x/beta) - 1) = 2*beta*sigmoid(2x/beta) - beta
+                # so the reciprocals and the 2*beta factors fold at trace time.
+                inv_2beta = cutlass.Float32(2.0 / self.situ_beta)
+                two_beta = cutlass.Float32(2.0 * self.situ_beta)
+                neg_beta = cutlass.Float32(-self.situ_beta)
+                inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
+                two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
+                neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
+
+                gs = _sigmoid(*cute.arch.mul_packed_f32x2((g0, g1), (inv_2beta, inv_2beta)))
+                tanh_g = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)), (neg_beta, neg_beta)
+                )
+
+                us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
+                tanh_u = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
+                )
+
+                situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_pair)
+                out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
 
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]

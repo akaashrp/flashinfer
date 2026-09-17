@@ -1,8 +1,11 @@
 # Qualifying Rubin MegaMoE for upstream
 
 The SM107 backends expose NVFP4, MXFP8 E4M3, and MXFP8 E5M2 inference through
-`MoEEpLayer`. The vendored implementation is the PR #4601 `92dd334` export;
-the Blackwell code is retained under `kernel_src/sm100/cutedsl_megamoe`,
+`MoEEpLayer`. The current generic implementation is the upstream `1667b47a`
+export, pinned in [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md).
+The bundled GenPhase entry point is not yet exposed by these backends.
+Earlier native results on PR #4601's `92dd334` snapshot do not qualify a new
+device-code drop. The Blackwell code is retained under `kernel_src/sm100/cutedsl_megamoe`,
 including BF16 support added after the original PR. The following evidence
 is required for a merge. Host tests and measurements on Blackwell do not
 establish Rubin kernel correctness or performance.

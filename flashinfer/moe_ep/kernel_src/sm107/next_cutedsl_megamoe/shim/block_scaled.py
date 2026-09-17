@@ -454,10 +454,8 @@ class Sm107BlockScaledSymmBuffer:
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
 
+        from sources import RubinInferenceMegaMoE
         from sources.api import ImplDesc, ProblemDesc
-        from sources.kernel_src.rubin.inference.mega import (
-            BlockScaledSwapAbMegaMoeKernel,
-        )
         from sources.quant_def import CombineFormat
 
         tiler = cfg.resolved_mma_tiler_mnk
@@ -542,7 +540,7 @@ class Sm107BlockScaledSymmBuffer:
             )
             impl_fields["preferred_cluster_count"] = preferred_count
             impl_fields["fallback_cluster_count"] = fallback_count
-        return BlockScaledSwapAbMegaMoeKernel(problem_desc, ImplDesc(impl_fields))
+        return RubinInferenceMegaMoE(problem_desc, ImplDesc(impl_fields))
 
     def note_staged_tokens(self, num_tokens: int) -> None:
         self._staged_tokens = int(num_tokens)

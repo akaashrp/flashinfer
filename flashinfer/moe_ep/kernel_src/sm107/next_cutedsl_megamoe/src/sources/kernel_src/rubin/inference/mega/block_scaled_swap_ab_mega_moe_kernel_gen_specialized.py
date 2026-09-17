@@ -1,5 +1,31 @@
-"""Fused pull-dispatch MegaMoE kernel composition for Rubin."""
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Generation-phase MegaMoE kernel composition for Rubin.
 
+Specialised for few tokens per rank and large expert parallelism. The narrowing
+buys a short communication path: ``GenphaseTokenComm`` is a separate launch that
+fires ``griddepcontrol_launch_dependents`` at entry, so this kernel becomes
+eligible immediately and streams weights while the payload is still on the wire.
+
+Three consequences of that split shape the kernel.
+
+Readiness is whole-rank. The communication component publishes four counters for
+its entire grid rather than one per token tile, so each consumer warp waits once
+before its work loop instead of per tile, and the FC12 extension runs with no FC1
+ready counter at all.
+
+There are no transfer warps. Nothing here pulls payloads into an expert pool and
+nothing pushes results back: FC1 gathers straight from the dense received plane,
+and the FC2 epilogue warps send results to their owning rank themselves through
+the bulk reduce-add. Twelve warps cover every role.
+
+The kernel owns the workspace tail reset. Because it outlives the communication
+kernel, it is the only participant that can safely zero the counters, which it
+does between two NVLink barriers so that no rank observes a half-cleared
+workspace or exits before the clearing is visible.
+"""
+
+import math
 from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -10,49 +36,65 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cutlass_dsl import Boolean, Int32
+from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
-from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
+from .....api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
+from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
+from .....helpers.dsl_helpers import spin_wait
 from .....helpers.iket_compat import iket
 from .....helpers.smem_workspace import SmemWorkspace
+from .....helpers.software_sync import NvlinkBarrier
 from .....helpers.utils import ceil_div, round_up
 from .....quant_def import CombineFormat, QuantKind
 from ....schedulers.base import WorkIdAcquisitionMode
-from ....schedulers.fc12_scheduler import (
-    BlackwellFusedFc12Scheduler,
-    PhaseInterleavedFc12Scheduler,
-    minimum_phase_interleave_hint,
-)
-from ....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
-from ...custom_mix_cga_helpers import TmaAtomOrPair, pipeline_init_arrive_mixed_cga, pipeline_init_wait_mixed_cga
+from ....schedulers.fc12_scheduler import BlackwellFusedFc12Scheduler, PhaseInterleavedFc12Scheduler
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
-from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
+from .block_scaled_swap_ab_fc12_mainloop_gen_specialized import BlockScaledSwapAbFc12MainloopGenSpecialized
+from .token_comm_gen_specialized import GenphaseTokenComm, GenphaseTokenCommArgs
 from .topk_reduce import TopkReduce
 
 
-_aot_symbol_prefix = "rubin_mega_moe_aot"
+_aot_symbol_prefix = "rubin_genphase_mega_moe_aot"
 
 
-class BlockScaledSwapAbMegaMoeKernel(KernelClass):
-    """Compose pull dispatch, persistent FC12, token-back, and reduction."""
+class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
+    """Compose generation-phase dispatch, persistent FC12, and the return path."""
 
-    fc1_output_region: ClassVar[str] = "rubin.mega_moe.fc1_output"
-    fc1_output_sf_region: ClassVar[str] = "rubin.mega_moe.fc1_output_sf"
-    fc1_done_counter_region: ClassVar[str] = "rubin.mega_moe.fc1_done_counter"
+    fc1_output_region: ClassVar[str] = "rubin.genphase_moe.fc1_output"
+    fc1_output_sf_region: ClassVar[str] = "rubin.genphase_moe.fc1_output_sf"
+    fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.fc1_done_counter"
+    pre_reduced_activation_region: ClassVar[str] = "rubin.genphase_moe.pre_reduced_activation"
+
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
     tma_a_warp_id: ClassVar[int] = 5
     tma_b_warp_id: ClassVar[int] = 6
     scheduler_warp_id: ClassVar[int] = 7
-    transfer_warp_idx_start: ClassVar[int] = 8
-    token_in_end_warp_idx: ClassVar[int] = 12
-    scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
+    gather_b_warp_ids: ClassVar[Tuple[int, int, int, int]] = (8, 9, 10, 11)
+    scheduler_consumer_thread_count: ClassVar[int] = 11 * 32
     epilogue_register_count: ClassVar[int] = 256
-    scheduler_register_count: ClassVar[int] = 72
+    other_warp_register_count: ClassVar[int] = 80
+    tail_barrier_id: ClassVar[int] = 8
+
+    # Tuned for Rubin, not portable. VR200 carries 212 SMs and this kernel's 46
+    # four-CTA clusters occupy 184, leaving 28 for the communication grid; go over that
+    # and the main kernel loses its last cluster, which is not optional because the
+    # tail barrier needs every CTA resident at once. The communication exchange CTAs
+    # exit as soon as their count rows are published, so the resident set is one helper
+    # plus these pushers. Porting to Blackwell means deriving this number again from
+    # that part's SM count and cluster capacity.
+    pusher_cta_count: ClassVar[int] = 27
+    refine_participant_groups: ClassVar[int] = 2
+    refine_output_stages: ClassVar[int] = 4
+
+    cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
+    mma_k_mode: ClassVar[str] = "2x"
+    a_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
+    b_major_mode: ClassVar[OperandMajorMode] = OperandMajorMode.K
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
@@ -61,12 +103,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "intermediate_gateup_size": StaticOrRuntimeIntegerType,
             "hidden_size": StaticOrRuntimeIntegerType,
             "quant_kind": str,
-            "a_major_mode": OperandMajorMode,
-            "b_major_mode": OperandMajorMode,
             "combine_format": CombineFormat,
             "gate_up_clamp": Optional[float],
-            "situ_beta": OptionalRequirement(Optional[float]),
-            "situ_linear_beta": OptionalRequirement(Optional[float]),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -75,12 +113,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         }
 
     @classmethod
-    def impl_desc_require(cls) -> dict[str, type]:
+    def impl_desc_require(cls) -> dict[str, object]:
         return {
             "mma_instruction_mnk": tuple,
             "mma_tiler_mnk": tuple,
-            "mma_k_mode": str,
-            "cluster_shape_mn": tuple,
             "use_2cta_instrs": bool,
             "schedule_policy": tuple,
             "token_padding_block": int,
@@ -89,16 +125,29 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "fc2_use_bulk": bool,
             "epi_flag_batches": tuple,
             "launch_cluster_count": int,
-            "fallback_cluster_shape_mn": OptionalRequirement(Optional[tuple]),
-            "preferred_cluster_count": OptionalRequirement(Optional[int]),
-            "fallback_cluster_count": OptionalRequirement(Optional[int]),
-            "token_in_flag_batch": int,
-            "token_back_mode": str,
             "reduce_topk_in_kernel": bool,
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+
+        for field_name, fixed_value, supplied_value in (
+            ("cluster_shape_mn", self.cluster_shape_mn, impl_desc.get("cluster_shape_mn")),
+            ("mma_k_mode", self.mma_k_mode, impl_desc.get("mma_k_mode")),
+            ("a_major_mode", self.a_major_mode, problem_desc.get("a_major_mode")),
+            ("b_major_mode", self.b_major_mode, problem_desc.get("b_major_mode")),
+        ):
+            if supplied_value is not None and supplied_value != fixed_value:
+                raise ValueError(
+                    f"The generation-phase kernel fixes {field_name} at {fixed_value}, got {supplied_value}."
+                )
+
+        fallback_cluster_shape_mn = impl_desc.get("fallback_cluster_shape_mn")
+        if fallback_cluster_shape_mn is not None and fallback_cluster_shape_mn != self.cluster_shape_mn:
+            raise ValueError(
+                f"The generation-phase kernel launches a single {self.cluster_shape_mn} cluster shape, so "
+                f"fallback_cluster_shape_mn must be unset or equal to it, got {fallback_cluster_shape_mn}."
+            )
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -109,12 +158,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.sf_dtype = self.quant_kind.sf_dtype
         self.sf_vec_size = self.quant_kind.sf_vec_size
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
-        self.a_major_mode = problem_desc["a_major_mode"]
-        self.b_major_mode = problem_desc["b_major_mode"]
         self.combine_format = problem_desc["combine_format"]
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
-        self.situ_beta = problem_desc.get("situ_beta")
-        self.situ_linear_beta = problem_desc.get("situ_linear_beta")
         self.world_size = problem_desc["world_size"]
         self.topk = problem_desc["topk"]
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
@@ -123,8 +168,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         self.mma_instruction_mnk = impl_desc["mma_instruction_mnk"]
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
-        self.mma_k_mode = impl_desc["mma_k_mode"]
-        self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
         self.schedule_policy = impl_desc["schedule_policy"]
         if len(self.schedule_policy) != 2:
@@ -136,34 +179,14 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.fc2_use_bulk = impl_desc["fc2_use_bulk"]
         self.epi_flag_batches = impl_desc["epi_flag_batches"]
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
-        self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
-        self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
 
         self.occupancy = 1
         self.architecture = "sm_107"
+        self.threads_per_cta = 12 * 32
         self.local_expert_count = self.expert_count // self.world_size
-        self.threads_per_cta = 16 * 32 if self.token_back_mode == "standalone_warps" else 12 * 32
-        self.other_warp_register_count = 64 if self.token_back_mode == "standalone_warps" else 72
-
-        self.mixed_cga_config = NonClcMixedCgaConfig(
-            preferred_cluster_shape=self.cluster_shape_mn,
-            fallback_cluster_shape=impl_desc.get("fallback_cluster_shape_mn"),
-            launch_cluster_count=self.launch_cluster_count,
-            preferred_cluster_count=impl_desc.get("preferred_cluster_count"),
-            fallback_cluster_count=impl_desc.get("fallback_cluster_count"),
-        )
-        self.fallback_cluster_shape_mn = self.mixed_cga_config.fallback_cluster_shape
-        self.preferred_cluster_count = self.mixed_cga_config.preferred_cluster_count
-        self.fallback_cluster_count = self.mixed_cga_config.fallback_cluster_count
-        self.resolved_fallback_cluster_shape_mn = (
-            self.cluster_shape_mn if self.fallback_cluster_shape_mn is None else self.fallback_cluster_shape_mn
-        )
-        if self.launch_cluster_count != self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred:
-            raise ValueError(
-                "launch_cluster_count must equal the canonical preferred-cluster slot count resolved from "
-                "preferred_cluster_count and fallback_cluster_count."
-            )
+        self.cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+        self.promised_launchable_sm_count = self.launch_cluster_count * self.cluster_size
 
         self._validate_geometry()
         self._resolve_schedule_hint()
@@ -179,46 +202,41 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
-        instruction_cta_m = self.mma_instruction_mnk[0] // mma_cta_count
-        instruction_m_repetitions = self.mma_tiler_mnk[0] // self.mma_instruction_mnk[0]
-        hidden_per_fc2_cluster_tile = instruction_cta_m * instruction_m_repetitions * self.cluster_shape_mn[0]
-        fc2_done_signals_per_token_tile = (
-            ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
-            * self.cluster_shape_mn[0]
-            * self.cluster_shape_mn[1]
-        )
+        self.cta_tile_m = self.mma_tiler_mnk[0] // mma_cta_count
+        self.cta_tile_n = self.mma_tiler_mnk[1]
+
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
-                "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
-                "preferred_cluster_count": self.preferred_cluster_count,
-                "fallback_cluster_count": self.fallback_cluster_count,
-                "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
-                "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
-                "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
-                "token_back_schedule_mode": ("atomic_counter" if self.work_id_mode == "atomic_counter" else "static"),
-                "router_smem_limit_bytes": cutlass.memory.get_smem_capacity_in_bytes(self.architecture),
+                "pusher_cta_count": self.pusher_cta_count,
+                "refine_participant_groups": self.refine_participant_groups,
+                "refine_output_stages": self.refine_output_stages,
             }
         )
-        self.token_comm = TokenCommNonDeterministic(problem_desc, token_comm_impl_desc)
-        self.max_tokens = self.token_comm.worst_case_token_count
+        self.token_comm = GenphaseTokenComm(problem_desc, token_comm_impl_desc)
+        self.max_routed_rows = self.token_comm.worst_case_data_rows
+        self._validate_communication_geometry()
+        self.tail_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.tail_barrier_id)
 
         fc12_problem_desc = ProblemDesc({**problem_desc, "expert_count": self.local_expert_count})
         resolved_impl_desc = ImplDesc(
             {
                 **impl_desc,
-                "fallback_cluster_shape_mn": self.fallback_cluster_shape_mn,
-                "preferred_cluster_count": self.preferred_cluster_count,
-                "fallback_cluster_count": self.fallback_cluster_count,
+                # Fixed here, but the scheduler and the epilogue read them from the
+                # descriptor, so they have to be forwarded rather than assumed.
+                "cluster_shape_mn": self.cluster_shape_mn,
+                "mma_k_mode": self.mma_k_mode,
                 "hint": self.hint,
                 "tmem_plan": tmem_plan,
                 "is_swap_ab": True,
-                "max_tokens": self.max_tokens,
+                "max_tokens": self.max_routed_rows,
                 "num_scheduler_consumer_threads": self.scheduler_consumer_thread_count,
                 "num_accumulator_consumer_warps_per_cta": len(self.epilogue_warp_ids),
                 "communication_enabled": True,
-                "token_back_push_data": self.token_comm.token_back_push_data,
+                # No token-back path exists in this component, so results never
+                # take the local route and the FC2 store is always the peer-facing
+                # bulk reduce-add.
+                "token_back_push_data": False,
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
             }
@@ -234,11 +252,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("Epilogue FC1 output scale dtype must match the Mainloop scale dtype.")
         if self.epilogue.sf_vec_size != self.sf_vec_size:
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
+        if not self.epilogue.fc2_use_ublk:
+            raise ValueError(
+                "The generation-phase FC2 store must be the bulk path: set fc2_use_bulk=True so the epilogue "
+                "selects the peer-facing UBLK store."
+            )
+        if self.epilogue.token_back_enabled:
+            raise ValueError("The generation-phase communication component provides no token-back path.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self._topk_reduce = (
             None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format)
         )
+
+    # ------------------------------------------------------------------
+    # Construction-time validation
+    # ------------------------------------------------------------------
 
     def _validate_geometry(self) -> None:
         static_expert_dimensions = (
@@ -247,28 +276,41 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             isinstance(self.hidden_size, int),
         )
         if any(static_expert_dimensions) and not all(static_expert_dimensions):
-            raise ValueError("MegaMoE expert dimensions must be either all static or all runtime.")
+            raise ValueError("Genphase MegaMoE expert dimensions must be either all static or all runtime.")
         if not all(static_expert_dimensions):
-            raise NotImplementedError("The MegaMoE Kernel currently requires static expert dimensions.")
+            raise NotImplementedError("The Genphase MegaMoE kernel currently requires static expert dimensions.")
         if self.expert_count <= 0 or self.intermediate_gateup_size <= 0 or self.hidden_size <= 0:
-            raise ValueError("MegaMoE expert dimensions must be positive.")
+            raise ValueError("Genphase MegaMoE expert dimensions must be positive.")
         if self.world_size <= 0 or self.expert_count % self.world_size != 0:
             raise ValueError("expert_count must be divisible by a positive world_size.")
         if self.topk <= 0 or self.topk > self.expert_count:
             raise ValueError("topk must be positive and no greater than expert_count.")
         if self.topk_index_dtype not in (cutlass.Int32, cutlass.Int64):
             raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
+        # The FC2 epilogue carries no per-row top-k weight, so folding the weight
+        # in at FC1 is the only way an in-kernel reduction can be correct. The
+        # alternative costs a (token, topk, hidden) symmetric plane and a second
+        # launch -- see the pre-reduced region in _build_device_workspace.
         if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
-            raise ValueError("In-kernel top-k reduction requires apply_topk_at_fc1=True.")
+            raise ValueError(
+                "In-kernel top-k reduction requires apply_topk_at_fc1=True. Applying the weight at FC2 instead "
+                "means reduce_topk_in_kernel=False, which allocates the (token, topk, hidden) staging plane and "
+                "adds a standalone TopkReduce launch."
+            )
+        # A quantized combine format would derive token_back_push_sf, and with it a
+        # token-back path this component does not have: no FC2 done counter, no
+        # FC2 output scale plane, no transfer warps.
+        if self.combine_format.act_dtype is not cutlass.BFloat16:
+            raise ValueError(
+                "The generation-phase kernel requires a BF16 combine format: a quantized payload would need the "
+                "token-back path, which the generation-phase communication component does not provide."
+            )
         if self.intermediate_gateup_size % 2 != 0:
             raise ValueError("The SwiGLU intermediate dimension must be even.")
-        intermediate_downproj = self.intermediate_gateup_size // 2
         if self.max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive.")
-        if self.token_padding_block <= 0:
-            raise ValueError("token_padding_block must be positive.")
-        if self.token_padding_block % 64 != 0:
-            raise ValueError("token_padding_block must be a multiple of 64.")
+        if self.token_padding_block <= 0 or self.token_padding_block % 64 != 0:
+            raise ValueError("token_padding_block must be a positive multiple of 64.")
         if self.launch_cluster_count <= 0:
             raise ValueError("launch_cluster_count must be positive.")
         if self.schedule_mode not in ("grouped", "phase_interleave"):
@@ -282,15 +324,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if len(self.epi_flag_batches) != 2:
             raise ValueError("epi_flag_batches must contain FC1 and FC2 batch sizes.")
         if any(batch < 1 or batch > len(self.epilogue_warp_ids) for batch in self.epi_flag_batches):
-            raise ValueError(
-                f"Rubin asynchronous epi_flag_batches values must be in [1, {len(self.epilogue_warp_ids)}]."
-            )
+            raise ValueError(f"epi_flag_batches values must be in [1, {len(self.epilogue_warp_ids)}].")
         if self.sf_vec_size <= 0:
             raise ValueError("sf_vec_size must be positive.")
+
         for field_name, dimensions, expected_rank in (
             ("mma_instruction_mnk", self.mma_instruction_mnk, 3),
             ("mma_tiler_mnk", self.mma_tiler_mnk, 3),
-            ("cluster_shape_mn", self.cluster_shape_mn, 2),
         ):
             if len(dimensions) != expected_rank:
                 raise ValueError(f"{field_name} must contain {expected_rank} dimensions.")
@@ -298,21 +338,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise TypeError(f"{field_name} dimensions must be Python integers.")
             if any(dimension <= 0 for dimension in dimensions):
                 raise ValueError(f"{field_name} dimensions must be positive.")
-        if self.quant_kind == QuantKind.mxfp4_mxfp8:
-            # Rubin consumes the mixed FP4 weight from native packed SMEM. Its K-major source only
-            # needs ordinary 16-byte TMA alignment and complete SFVec32 blocks.
-            for name, extent in (("hidden_size", self.hidden_size), ("intermediate_downproj", intermediate_downproj)):
-                if extent * int(self.a_dtype.width) % 128 != 0 or extent % self.sf_vec_size != 0:
-                    raise ValueError(
-                        f"Rubin {self.quant_kind} requires {name} to satisfy ordinary TMA and "
-                        f"SFVec{self.sf_vec_size} alignment, got {extent}."
-                    )
-        if self.mma_k_mode != "2x":
-            raise ValueError(f"Rubin MegaMoE requires mma_k_mode='2x', got {self.mma_k_mode!r}.")
 
         mma_m, mma_n, mma_k = self.mma_tiler_mnk
         instruction_m, instruction_n, instruction_k = self.mma_instruction_mnk
-        cluster_m, cluster_n = self.cluster_shape_mn
+        mma_cta_count = 2 if self.use_2cta_instrs else 1
         expected_instruction_m = 256 if self.use_2cta_instrs else 128
         if instruction_m != expected_instruction_m:
             raise ValueError(
@@ -325,40 +354,45 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 f"{self.quant_kind} requires Rubin 2x instruction K={expected_instruction_k}, got {instruction_k}."
             )
         if (instruction_m, instruction_n) != (mma_m, mma_n):
-            raise NotImplementedError("Rubin MegaMoE does not implement M/N instruction repetition or B-reuse.")
-        if mma_n not in (64, 128, 256):
-            raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
+            raise NotImplementedError("Rubin Genphase MegaMoE does not implement M/N instruction repetition.")
+        # Tile N 64 is excluded because it turns on the halved SFB tile index and
+        # the SFB TMEM shift, and 512 is excluded because the FC1 gather needs one
+        # B row per 128-byte swizzle atom (see the mainloop's gather geometry).
+        if mma_n not in (128, 256):
+            raise ValueError(f"mma_tiler N must be 128 or 256, got {mma_n}.")
         if mma_k % instruction_k != 0:
             raise ValueError("mma_tiler K must be divisible by instruction K.")
         if mma_k % (self.sf_vec_size * 4) != 0:
             raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
-        if self.quant_kind == QuantKind.nvfp4 and (mma_n, mma_k) == (256, 512):
-            raise ValueError(
-                "Rubin MegaMoE excludes NVFP4 N256 K512 because its multi-window path has no measured gain."
-            )
-        if self.quant_kind == QuantKind.mxfp4_mxfp8:
-            sf_atom_size = self.sf_vec_size * 4
-            if intermediate_downproj % sf_atom_size != 0:
-                raise ValueError(
-                    f"The mixed-precision down-projection dimension must be divisible by one "
-                    f"four-vector SF atom ({sf_atom_size} elements)."
-                )
-        elif self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
+        if self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
             raise ValueError("The intermediate dimension must be divisible by four scale-factor vectors.")
-        if cluster_n != 1:
-            raise ValueError(f"The swap-AB FC12 path requires cluster N=1, got {cluster_n}.")
-        if cluster_m <= 0 or cluster_m > 16 or cluster_m & (cluster_m - 1):
-            raise ValueError("cluster M must be a power of two no greater than 16.")
-        if self.use_2cta_instrs and cluster_m % 2 != 0:
-            raise ValueError("Two-CTA MMA requires an even cluster M.")
-        if self.fallback_cluster_shape_mn is not None:
-            fallback_cluster_m, fallback_cluster_n = self.fallback_cluster_shape_mn
-            if fallback_cluster_n != 1:
-                raise ValueError(f"The swap-AB FC12 fallback path requires cluster N=1, got {fallback_cluster_n}.")
-            if fallback_cluster_m <= 0 or fallback_cluster_m > 16 or fallback_cluster_m & (fallback_cluster_m - 1):
-                raise ValueError("fallback cluster M must be a power of two no greater than 16.")
-            if self.use_2cta_instrs and fallback_cluster_m % 2 != 0:
-                raise ValueError("Two-CTA MMA requires an even fallback cluster M.")
+        if mma_m // mma_cta_count != 128:
+            raise ValueError(f"The epilogue fixes the per-CTA output tile at 128, got {mma_m // mma_cta_count}.")
+        # The epilogue picks the TMA owner warp with `warp_idx == subtile_idx` and
+        # does not check the bound itself, so a wider token tile would drop stores.
+        subtile_count = mma_n // 64
+        if subtile_count > len(self.epilogue_warp_ids):
+            raise ValueError(
+                f"mma_tiler N {mma_n} needs {subtile_count} epilogue subtiles, more than the "
+                f"{len(self.epilogue_warp_ids)} epilogue warps that own them."
+            )
+
+    def _validate_communication_geometry(self) -> None:
+        """Check where the FC12 tiling has to agree with the communication pools.
+
+        A gather row index is read from GMEM before it reaches the descriptor, so
+        unlike a coordinate it is not bounds-checked: the read itself has to stay
+        inside the index array. A gather window starts at a tile base inside the
+        padded data pool and spans a whole token tile, so its last row can sit
+        ``cta_tile_n - 1`` past the final expert, and the index array carries
+        exactly that much readable slack for exactly this reason.
+        """
+        if self.cta_tile_n > self.token_comm.gather_index_tail_slack:
+            raise ValueError(
+                f"A token tile of {self.cta_tile_n} rows can read up to {self.cta_tile_n - 1} rows past the last "
+                f"expert, exceeding the {self.token_comm.gather_index_tail_slack} rows of readable slack the gather "
+                f"index array carries."
+            )
 
     def _resolve_schedule_hint(self) -> None:
         if self.schedule_mode != "phase_interleave":
@@ -368,32 +402,36 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         cluster_feature_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
         blocks_fc1 = ceil_div(self.intermediate_gateup_size, cluster_feature_tile)
         blocks_fc2 = ceil_div(self.hidden_size, cluster_feature_tile)
-        raw_minimum_hint = minimum_phase_interleave_hint(
-            blocks_fc1=blocks_fc1,
-            blocks_fc2=blocks_fc2,
-            launch_cluster_cnt_merge_as_preferred=self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred,
-        )
+        # Cover the worst token-block alignment of one full persistent-cluster FC2 claim wave.
+        max_dependent_token_blocks = ceil_div(self.launch_cluster_count + blocks_fc2 - 1, blocks_fc2)
+        required_fc1_work = max_dependent_token_blocks * blocks_fc1
+        raw_minimum_hint = max(1, ceil_div(required_fc1_work, self.launch_cluster_count))
         minimum_safe_hint = round_up(raw_minimum_hint, self.epi_flag_batches[0])
         if self.hint is None:
             self.hint = minimum_safe_hint
         elif self.hint < minimum_safe_hint:
             raise ValueError(
                 f"phase_interleave hint {self.hint} is unsafe with "
-                f"fc1_epi_flag_batch={self.epi_flag_batches[0]}; "
-                f"minimum legal hint is {minimum_safe_hint}."
+                f"fc1_epi_flag_batch={self.epi_flag_batches[0]}; minimum legal hint is {minimum_safe_hint}."
             )
+
+    # ------------------------------------------------------------------
+    # Workspaces
+    # ------------------------------------------------------------------
 
     def _build_device_workspace(self) -> DeviceWorkspace:
         intermediate_downproj = self.intermediate_gateup_size // 2
         sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
-        max_sf_rows = self.token_comm.worst_case_sf_token_count
-        counter_slot_count = self.token_comm.max_fc1_ready_slot_count
+        max_sf_rows = self.token_comm.worst_case_sf_rows
+        # One slot per token block across every local expert, which is the space
+        # `cumulative_token_block_count + tile_n_idx` indexes.
+        counter_slot_count = self.token_comm.worst_case_padded_rows(self.cta_tile_n) // self.cta_tile_n
 
         device_workspace = DeviceWorkspace()
         device_workspace.register(
             self.fc1_output_region,
             self.epilogue.fc1_output_dtype,
-            (self.max_tokens, intermediate_downproj),
+            (self.max_routed_rows, intermediate_downproj),
             buffer_space="local",
             mem_order=(1, 0),
             byte_alignment=128,
@@ -414,13 +452,47 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        if not self.reduce_topk_in_kernel:
+            # Peers write their contributions straight into this plane, one row per
+            # (token, top-k slot), so it has to be symmetric. The standalone
+            # TopkReduce launch folds it into the caller's output afterwards.
+            device_workspace.register(
+                self.pre_reduced_activation_region,
+                self.combine_format.act_dtype,
+                (self.max_tokens_per_rank, self.topk, self.hidden_size),
+                buffer_space="shared",
+                mem_order=(2, 1, 0),
+                byte_alignment=128,
+            )
         self.scheduler.register_device_workspace(device_workspace)
+        self.tail_barrier.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
         device_workspace.finalize()
         return device_workspace
 
+    def _build_mainloop_and_smem(
+        self, problem_desc: ProblemDesc, resolved_impl_desc: ImplDesc
+    ) -> Tuple[BlockScaledSwapAbFc12MainloopGenSpecialized, SmemWorkspace]:
+        # The communication component builds its own SMEM workspace for its own
+        # launch, so nothing of it is charged against this kernel's budget.
+        smem_limit = cutlass.memory.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
+        smem_workspace = SmemWorkspace()
+        self.scheduler.register_smem_regions(smem_workspace)
+        self.epilogue.register_smem_regions(smem_workspace)
+        fixed_component_bytes = smem_workspace.estimate_total_bytes()
+        alignment_shift_bytes = max(region.byte_alignment for region in smem_workspace.regions())
+        mainloop_smem_budget_bytes = smem_limit - fixed_component_bytes - alignment_shift_bytes
+        if mainloop_smem_budget_bytes <= 0:
+            raise ValueError("Fixed kernel components leave no SMEM budget for the Mainloop.")
+
+        mainloop_impl_desc = ImplDesc({**resolved_impl_desc, "mainloop_smem_budget_bytes": mainloop_smem_budget_bytes})
+        mainloop = BlockScaledSwapAbFc12MainloopGenSpecialized(problem_desc, mainloop_impl_desc)
+
+        mainloop.register_smem_regions(smem_workspace)
+        smem_workspace.finalize(max_bytes=smem_limit)
+        return mainloop, smem_workspace
+
     def get_workspace_sizes(self) -> Tuple[int, int]:
-        """Return required local and shared workspace bytes."""
         return self._device_workspace.local_and_shared_bytes
 
     @property
@@ -440,50 +512,38 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         instruction = "x".join(str(dimension) for dimension in self.mma_instruction_mnk)
         tile = "x".join(str(dimension) for dimension in self.mma_tiler_mnk)
         cluster = "x".join(str(dimension) for dimension in self.cluster_shape_mn)
-        fallback_cluster = (
-            "none"
-            if self.fallback_cluster_shape_mn is None
-            else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
-        )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
         return (
-            f"sm107_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
+            f"sm107_block_scaled_swap_ab_gen_phase_specialized_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
             f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
-            f"e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
+            f"w{self.world_size}_e{self.expert_count}_topk{self.topk}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
             f"h{self.hidden_size}_i{self.intermediate_gateup_size}_maxtoken{self.max_tokens_per_rank}_"
             f"inst{instruction}_{self.mma_k_mode}_tile{tile}_"
             f"cluster{cluster}_{'2cta' if self.use_2cta_instrs else '1cta'}_"
-            f"fallback{fallback_cluster}_prefclusters{self.preferred_cluster_count}_"
-            f"fallbackclusters{self.fallback_cluster_count}_"
             f"sched{self.schedule_mode}_hint{self.hint}_pad{self.token_padding_block}x{self.sf_padding_block}_"
             f"work{self.work_id_mode}_"
-            f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
+            f"fc2store{'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
-            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
-            f"tokeninflag{self.token_in_flag_batch}_tokenback{self.token_back_mode}_"
+            f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_"
+            f"pusher{self.pusher_cta_count}_refine{self.refine_participant_groups}x{self.refine_output_stages}_"
             f"combine{self.combine_format.name}_clamp{self.gate_up_clamp}_"
-            # The SiTU betas are codegen-time constants, so they must key the compiled kernel.
-            f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
-            f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
+            f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
         """Compile against fake (metadata-only) inputs; ``out_path=None`` returns the in-memory callable.
 
-        The fake tensors define the runtime ABI, so each mirrors what the caller stages: the per-rank expert slice,
-        the padded SF extents, and ``to_cute``'s ``mark_layout_dynamic`` (the stride-1 axis stays static, every
-        other axis becomes a runtime SymInt). ``stride_order`` follows the input generator's ``memory_order``, where
-        0 is the innermost axis. Occupancy is a construction-time knob (``launch_cluster_count``), so unlike the
-        pre-``next`` kernel this entry accepts no occupancy argument and tolerates leftover caller kwargs.
+        The fake tensors define the runtime ABI, so each mirrors what the caller stages: the local expert tensors,
+        the padded payload strides the communication component advertises, and ``to_cute``'s
+        ``mark_layout_dynamic``. Occupancy is a construction-time knob (``launch_cluster_count``), so this entry
+        accepts no occupancy argument and tolerates leftover caller kwargs.
         """
-        import math
-
         from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_ptr
         from cutlass.cute.typing import AddressSpace, sym_int64
-        from cutlass.cutlass_dsl import Int64
 
         from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferHost
 
@@ -500,34 +560,37 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         intermediate_downproj = intermediate_gateup // 2
         experts = self.local_expert_count
         sf_vec_size = self.sf_vec_size
-        # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
+        # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged.
         fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
         fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
-        # TopkReduce and the in-kernel REDG both take their output dtype from this tensor.
-        output_dtype = cutlass.BFloat16
 
         fake_arguments = dict(
-            # Swap-AB puts the weights on the MMA A operand, so the token wire dtype is TokenComm's, not a_dtype.
-            activation=fake_tensor(self.token_comm.activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
-            activation_sf=fake_tensor(
-                self.token_comm.activation_sf_dtype,
-                (tokens, self.token_comm.activation_sf_hidden_padded),
+            activation=fake_tensor(
+                self.token_comm.activation_dtype,
+                (tokens, self.token_comm.plain_activation_row_elements),
                 (1, 0),
-                {0},
+                {},
                 16,
             ),
-            topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
-            topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
-            fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
-            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
-            fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
-            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
-            output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
-            # Opaque byte workspaces: a bare base pointer, like to_cute_ptr. The 128-byte promise matches the
-            # alignment the registered regions assume, so the caller must hand over 128-byte-aligned bases.
+            activation_sf=fake_tensor(
+                self.token_comm.activation_sf_dtype,
+                (tokens, self.token_comm.plain_activation_sf_row_elements),
+                (1, 0),
+                {},
+                16,
+            ),
+            topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {}, 16),
+            topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {}, 4),
+            fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {1, 2}, 16),
+            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {1}, 16),
+            fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {1, 2}, 16),
+            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {1}, 16),
+            output_activation=fake_tensor(cutlass.BFloat16, (tokens, hidden), (1, 0), {}, 16),
             local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
             shared_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
-            # Placeholder field values: they marshal as runtime scalars. Only max_ranks is constexpr.
+            # Placeholder field values: they marshal as runtime scalars, so their widths
+            # are part of the ABI and bare Python ints would narrow the offsets to i32.
+            # Only max_ranks is constexpr.
             peer_rank_ptr_mapper_host=SymmetricBufferHost(
                 base_address=Int64(0),
                 offsets=tuple(Int64(0) for _ in range(self.world_size)),
@@ -537,9 +600,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             stream=make_fake_stream(),
         )
         if self.quant_kind.uses_global_scale:
-            # nvfp4 carries per-expert dequant scalars. Under an e8m0 scale they do not exist at
-            # all, and declaring them here would put three tensors in the ABI that the caller has
-            # no value for.
             fake_arguments.update(
                 fc1_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
                 fc2_alpha=fake_tensor(cutlass.Float32, (experts,), (0,), set(), 4),
@@ -558,39 +618,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
 
-    def _build_mainloop_and_smem(
-        self, problem_desc: ProblemDesc, resolved_impl_desc: ImplDesc
-    ) -> Tuple[BlockScaledSwapAbFc12Mainloop, SmemWorkspace]:
-        smem_limit = cutlass.memory.get_smem_capacity_in_bytes(self.architecture) // self.occupancy
-        smem_workspace = SmemWorkspace()
-        self.token_comm.register_smem_regions(smem_workspace)
-        self.scheduler.register_smem_regions(smem_workspace)
-        self.epilogue.register_smem_regions(smem_workspace)
-        fixed_component_bytes = smem_workspace.estimate_total_bytes()
-        alignment_shift_bytes = max(region.byte_alignment for region in smem_workspace.regions())
-        mainloop_smem_budget_bytes = smem_limit - fixed_component_bytes - alignment_shift_bytes
-        if mainloop_smem_budget_bytes <= 0:
-            raise ValueError("Fixed kernel components leave no SMEM budget for the Mainloop.")
-
-        mainloop_impl_desc = ImplDesc({**resolved_impl_desc, "mainloop_smem_budget_bytes": mainloop_smem_budget_bytes})
-        mainloop = BlockScaledSwapAbFc12Mainloop(problem_desc, mainloop_impl_desc)
-
-        mainloop.register_smem_regions(smem_workspace)
-        smem_workspace.finalize(max_bytes=smem_limit)
-        return mainloop, smem_workspace
+    # ------------------------------------------------------------------
+    # Host entry
+    # ------------------------------------------------------------------
 
     @cute.jit
     def __call__(
         self,
-        activation: cute.Tensor,  # (tokens, hidden)
-        activation_sf: cute.Tensor,  # (tokens, hidden // activation_sf_vector_size)
-        topk_indices: cute.Tensor,  # (tokens, topk)
-        topk_scores: cute.Tensor,  # (tokens, topk)
+        activation: cute.Tensor,  # (max_tokens_per_rank, padded hidden), padded row stride
+        activation_sf: cute.Tensor,  # (max_tokens_per_rank, padded hidden / sf_vec_size)
+        topk_indices: cute.Tensor,  # (max_tokens_per_rank, topk)
+        topk_scores: cute.Tensor,  # (max_tokens_per_rank, topk)
         fc1_weight: cute.Tensor,  # (local_experts, hidden, intermediate_gateup)
         fc1_weight_sf: cute.Tensor,  # (local_experts, packed_fc1_scale_factors)
         fc2_weight: cute.Tensor,  # (local_experts, intermediate_downproj, hidden)
         fc2_weight_sf: cute.Tensor,  # (local_experts, packed_fc2_scale_factors)
-        output_activation: cute.Tensor,  # (tokens, hidden)
+        output_activation: cute.Tensor,  # (max_tokens_per_rank, hidden)
         local_workspace: cute.Pointer,  # local GMEM byte workspace
         shared_workspace: cute.Pointer,  # symmetric GMEM byte workspace
         peer_rank_ptr_mapper_host,
@@ -599,7 +642,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
         fc1_norm_const: Optional[cute.Tensor] = None,  # (local_experts,)
     ) -> None:
-        """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+        """Launch generation-phase dispatch, fused FC12, and the optional top-k reduce."""
 
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
@@ -618,23 +661,24 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise TypeError(
                     f"{self.quant_kind} requires {operand_name} to be {expected_dtype}, got {operand.element_type}."
                 )
-        if cutlass.const_expr(not self.quant_kind.uses_global_scale):
+        if cutlass.const_expr(self.quant_kind.uses_global_scale):
             for scalar_name, scalar in (
                 ("fc1_alpha", fc1_alpha),
                 ("fc2_alpha", fc2_alpha),
                 ("fc1_norm_const", fc1_norm_const),
             ):
-                if cutlass.const_expr(scalar is not None):
-                    raise ValueError(
-                        f"{self.quant_kind} folds its rescale into the e8m0 scale factors, "
-                        f"so {scalar_name} must be None."
-                    )
+                if cutlass.const_expr(scalar is None):
+                    raise ValueError(f"{self.quant_kind} requires {scalar_name}.")
 
-        router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
         local_rank = peer_rank_ptr_mapper_host.rank
-        self.token_comm.launch_router(
-            topk_indices,
-            router_topk_scores,
+        router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
+        self.token_comm.launch(
+            GenphaseTokenCommArgs(
+                topk_indices=topk_indices,
+                topk_scores=router_topk_scores,
+                activation=activation,
+                activation_sf=activation_sf,
+            ),
             local_rank,
             local_workspace,
             shared_workspace,
@@ -643,10 +687,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             stream,
         )
 
-        peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
-        activation_pool = self.token_comm.fc1_activation_tensor(self._device_workspace)
-        activation_sf_pool = self.token_comm.fc1_activation_sf_tensor(self._device_workspace)
+        peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
+        dense_activation = self.token_comm.dense_activation_tensor(self._device_workspace)
+        canonical_activation_sf = self.token_comm.canonical_activation_sf_tensor(self._device_workspace)
+        scheduler_expert_sizes = self.token_comm.scheduler_expert_sizes_tensor(self._device_workspace)
         fc1_output = self._device_workspace.tensor(self.fc1_output_region)
         fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
 
@@ -658,7 +703,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_weight = rewrite_tensor_shape(fc2_weight, (experts, intermediate_downproj, hidden))
 
         singleton = cutlass.Int32(1)
-        token_rows = self.max_tokens
+        sf_vec_size = self.sf_vec_size
 
         fc1_a = cute.make_tensor(
             fc1_weight.iterator,
@@ -667,32 +712,33 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
             ),
         )
+        # FC1's B is the dense (source rank, source token) plane the communication
+        # kernel filled, indexed by `gather_index` rather than by a pool row, so it
+        # carries no per-expert offset.
         fc1_b = cute.make_tensor(
-            activation_pool.iterator,
+            dense_activation.iterator,
             cute.make_layout(
-                (token_rows, cutlass.Int32(hidden), singleton),
-                stride=(activation_pool.stride[0], activation_pool.stride[1], 0),
+                (dense_activation.shape[0], cutlass.Int32(hidden), singleton),
+                stride=(dense_activation.stride[0], dense_activation.stride[1], 0),
             ),
         )
         fc1_output_gemm = cute.make_tensor(
             fc1_output.iterator,
             cute.make_layout(
-                (token_rows, cutlass.Int32(intermediate_downproj), singleton),
+                (self.max_routed_rows, cutlass.Int32(intermediate_downproj), singleton),
                 stride=(fc1_output.stride[0], fc1_output.stride[1], 0),
             ),
         )
-
-        sf_vec_size = self.sf_vec_size
-        padded_token_rows = self.token_comm.worst_case_sf_token_count
-        padded_hidden = hidden
+        # The canonical scale-factor pool already carries the MMA's atom layout, so
+        # FC1's SFB leg is an ordinary tiled TMA over it.
         fc1_sfb = cute.make_tensor(
-            activation_sf_pool.iterator,
+            canonical_activation_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
+                (self.token_comm.worst_case_sf_rows, cutlass.Int32(hidden), singleton), sf_vec_size
             ),
         )
         padded_intermediate_gateup = cute.round_up(intermediate_gateup, sf_vec_size * 4)
-        expected_fc1_weight_sf_columns = padded_intermediate_gateup * padded_hidden // sf_vec_size
+        expected_fc1_weight_sf_columns = padded_intermediate_gateup * hidden // sf_vec_size
         if cutlass.const_expr(
             isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
         ):
@@ -701,8 +747,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_sfa = cute.make_tensor(
             fc1_weight_sf.iterator,
             blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
-                sf_vec_size,
+                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(hidden), cutlass.Int32(experts)), sf_vec_size
             ),
         )
 
@@ -736,7 +781,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 (fc1_output_sf.shape[0], cutlass.Int32(fc1_output_sf.shape[1] * sf_vec_size), singleton), sf_vec_size
             ),
         )
+
         if cutlass.const_expr(self.reduce_topk_in_kernel):
+            # Every top-k contribution reduces into the topk=0 plane, so the caller's
+            # output doubles as the (token, topk, hidden) destination. It has to live
+            # in the symmetric heap: peers reach it through the per-rank offset.
             pre_reduced_activation = cute.make_tensor(
                 output_activation.iterator,
                 cute.make_layout(
@@ -744,18 +793,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     stride=(output_activation.stride[0], output_activation.stride[0], output_activation.stride[1]),
                 ),
             )
-            pre_reduced_activation_sf = None
         else:
-            pre_reduced_activation = self.token_comm.pre_reduced_activation_tensor(self._device_workspace)
-            pre_reduced_activation_sf = self.token_comm.pre_reduced_activation_sf_tensor(self._device_workspace)
-
-        if cutlass.const_expr(self.token_comm.token_back_push_data):
-            fc2_output = self.token_comm.fc2_activation_tensor(self._device_workspace)
-        else:
-            fc2_output = rewrite_tensor_shape(
-                pre_reduced_activation, (pre_reduced_activation.shape[0], pre_reduced_activation.shape[1], hidden)
-            )
-        fc2_output_sf = self.token_comm.fc2_activation_sf_tensor(self._device_workspace)
+            pre_reduced_activation = self._device_workspace.tensor(self.pre_reduced_activation_region)
+        fc2_output = rewrite_tensor_shape(
+            pre_reduced_activation, (pre_reduced_activation.shape[0], pre_reduced_activation.shape[1], hidden)
+        )
 
         self._mainloop.materialize_codegen_members()
         (
@@ -767,14 +809,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc2_tma_a_atom,
             fc2_tma_sfa_tensor,
             fc2_tma_sfa_atom,
-            fc1_tma_b_tensor,
-            fc1_tma_b_atom_or_pair,
+            fc1_tma_b_atom,
             fc1_tma_sfb_tensor,
-            fc1_tma_sfb_atom_or_pair,
+            fc1_tma_sfb_atom,
             fc2_tma_b_tensor,
-            fc2_tma_b_atom_or_pair,
+            fc2_tma_b_atom,
             fc2_tma_sfb_tensor,
-            fc2_tma_sfb_atom_or_pair,
+            fc2_tma_sfb_atom,
         ) = self._mainloop.prepare_tma_load_params(
             fc1_a=fc1_a,
             fc1_b=fc1_b,
@@ -786,13 +827,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc2_sfb=fc2_sfb,
         )
 
-        (fc1_output_tma_atom, fc1_output_tma_tensor, fc2_output_tma_atom, fc2_output_tma_tensor) = (
-            self.epilogue.prepare_tma_store_params(fc1_output_gemm, fc2_output)
+        # FC2 stores through the peer-facing bulk path, so only the FC1 store atom
+        # comes back populated.
+        (fc1_output_tma_atom, fc1_output_tma_tensor, _, _) = self.epilogue.prepare_tma_store_params(
+            fc1_output_gemm, fc2_output
         )
 
         grid = self.scheduler.get_grid_shape(max_active_clusters=self.launch_cluster_count)
         self._device_workspace.remove_device_members()
-        kernel = self._kernel(
+        self._kernel(
             fc1_tma_a_tensor,
             fc1_tma_a_atom,
             fc1_tma_sfa_tensor,
@@ -801,57 +844,39 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc2_tma_a_atom,
             fc2_tma_sfa_tensor,
             fc2_tma_sfa_atom,
-            fc1_tma_b_tensor,
-            fc1_tma_b_atom_or_pair,
+            fc1_tma_b_atom,
             fc1_tma_sfb_tensor,
-            fc1_tma_sfb_atom_or_pair,
+            fc1_tma_sfb_atom,
             fc2_tma_b_tensor,
-            fc2_tma_b_atom_or_pair,
+            fc2_tma_b_atom,
             fc2_tma_sfb_tensor,
-            fc2_tma_sfb_atom_or_pair,
+            fc2_tma_sfb_atom,
             fc1_output_tma_atom,
             fc1_output_tma_tensor,
-            fc2_output_tma_atom,
-            fc2_output_tma_tensor,
             fc2_output,
-            fc2_output_sf,
             (experts, intermediate_gateup, hidden),
-            activation,
-            activation_sf,
-            pre_reduced_activation,
-            pre_reduced_activation_sf,
+            scheduler_expert_sizes,
             peer_rank_ptr_mapper,
-            local_rank,
             local_workspace,
             shared_workspace,
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            cluster=(*self.cluster_shape_mn, 1),
+            stream=stream,
+            min_blocks_per_mp=self.occupancy,
+            use_pdl=True,
         )
-        if cutlass.const_expr(self.mixed_cga_config.is_mixed):
-            kernel.launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=(*self.cluster_shape_mn, 1),
-                fallback_cluster=(*self.resolved_fallback_cluster_shape_mn, 1),
-                stream=stream,
-                min_blocks_per_mp=self.occupancy,
-                use_pdl=True,
-            )
-        else:
-            kernel.launch(
-                grid=grid,
-                block=[self.threads_per_cta, 1, 1],
-                cluster=(*self.cluster_shape_mn, 1),
-                stream=stream,
-                min_blocks_per_mp=self.occupancy,
-                use_pdl=True,
-            )
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            self._topk_reduce(
-                pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream
-            )
+            self._topk_reduce(pre_reduced_activation, None, output_activation, reduce_scores, stream)
+
+    # ------------------------------------------------------------------
+    # Device entry
+    # ------------------------------------------------------------------
 
     @cute.kernel
     def _kernel(
@@ -864,40 +889,35 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_tma_a_atom: cute.CopyAtom,
         fc2_tma_sfa_tensor: cute.Tensor,
         fc2_tma_sfa_atom: cute.CopyAtom,
-        fc1_tma_b_tensor: cute.Tensor,
-        fc1_tma_b_atom_or_pair: TmaAtomOrPair,
+        fc1_tma_b_atom: cute.CopyAtom,
         fc1_tma_sfb_tensor: cute.Tensor,
-        fc1_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc1_tma_sfb_atom: cute.CopyAtom,
         fc2_tma_b_tensor: cute.Tensor,
-        fc2_tma_b_atom_or_pair: TmaAtomOrPair,
+        fc2_tma_b_atom: cute.CopyAtom,
         fc2_tma_sfb_tensor: cute.Tensor,
-        fc2_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc2_tma_sfb_atom: cute.CopyAtom,
         fc1_output_tma_atom: cute.CopyAtom,
         fc1_output_tma_tensor: cute.Tensor,
-        fc2_output_tma_atom: Optional[cute.CopyAtom],
-        fc2_output_tma_tensor: Optional[cute.Tensor],
         fc2_output: cute.Tensor,
-        fc2_output_sf: Optional[cute.Tensor],
         actual_expert_shape: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
-        activation: cute.Tensor,
-        activation_sf: cute.Tensor,
-        pre_reduced_activation: cute.Tensor,
-        pre_reduced_activation_sf: Optional[cute.Tensor],
-        peer_rank_ptr_mapper,
-        local_rank: cutlass.Int32,
+        # Per-expert sizes in the order the scheduler walks them, which is the
+        # slot order rather than the expert order.
+        scheduler_expert_sizes: cute.Tensor,
+        peer_rank_ptr_mapper: SymmetricBufferDevice,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
     ):
-        """Compose TokenComm, Scheduler, Mainloop, and Epilogue."""
+        """Compose scheduler, mainloop, epilogue, and the workspace tail reset."""
         self._mainloop.materialize_codegen_members()
         storage_type = self._smem_workspace.storage_class()
         smem_allocator = utils.SmemAllocator()
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
         if cutlass.const_expr(isinstance(self.hidden_size, int)):
@@ -916,92 +936,97 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
 
         thread_idx, _, _ = cute.arch.thread_idx()
-        warp_idx = thread_idx // 32
+        warp_idx = cute.arch.make_warp_uniform(thread_idx // 32)
         block_idx = cute.arch.block_idx()
-        active_cluster_m = Int32(self.cluster_shape_mn[0])
-        is_fallback_cluster = Boolean(False)
-        if cutlass.const_expr(self.mixed_cga_config.is_mixed):
-            active_cluster_m, _, _ = cute.arch.block_in_cluster_dim()
-            is_fallback_cluster = active_cluster_m == Int32(self.resolved_fallback_cluster_shape_mn[0])
         cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-        cta_coord_in_cluster = (cta_rank_in_cluster, Int32(0), Int32(0))
-        linear_cta_idx = block_idx[0] + block_idx[2] * Int32(self.cluster_shape_mn[0])
-        token_comm_args = TokenCommArgs(
-            activation=activation,
-            activation_sf=activation_sf,
-            pre_reduced_activation=pre_reduced_activation,
-            pre_reduced_activation_sf=pre_reduced_activation_sf,
-            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
+        cta_coord_in_cluster = (
+            cta_rank_in_cluster % self.cluster_shape_mn[0],
+            cta_rank_in_cluster // self.cluster_shape_mn[0],
+            cutlass.Int32(0),
         )
-        self.token_comm.assign_device_members(
-            device_workspace=self._device_workspace,
-            token_comm_args=token_comm_args,
-            local_rank=local_rank,
-            linear_cta_idx=linear_cta_idx,
-        )
-        expert_token_sizes = self.token_comm.local_expert_sizes(self._device_workspace, local_rank)
-        token_src_metadata = self.token_comm.token_src_metadata_tensor(self._device_workspace)
-        fc2_done_counter = self.token_comm.fc2_done_counter_tensor(self._device_workspace)
-        pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
+        linear_cta_idx = cta_rank_in_cluster + block_idx[2] * Int32(self.cluster_size)
 
-        self._mainloop.assign_device_members(
-            self._smem_workspace, smem_base, cta_coord_in_cluster, is_fallback_cluster, hidden, intermediate_gateup
-        )
-        ab_pipeline = self._mainloop.create_ab_pipeline(self._smem_workspace, smem_base)
+        token_src_metadata = self.token_comm.token_src_metadata_tensor(self._device_workspace)
+        gather_index = self.token_comm.gather_index_tensor(self._device_workspace)
+        pool_topk_scores = self.token_comm.fc1_topk_scores_tensor(self._device_workspace)
+        self.tail_barrier.assign_device_members(self._device_workspace, peer_rank_ptr_mapper)
+
+        # Under the split-depth plan the weights and the tokens ride separate
+        # pipelines of different depth; under the shared plan `token_pipeline` is
+        # the same object, so every role below reads the same as it did before.
+        if cutlass.const_expr(self._mainloop.uses_asymmetric_ab_stages):
+            ab_pipeline = self._mainloop.create_weight_pipeline(self._smem_workspace, smem_base)
+            token_pipeline = self._mainloop.create_token_pipeline(self._smem_workspace, smem_base)
+        else:
+            ab_pipeline = self._mainloop.create_ab_pipeline(self._smem_workspace, smem_base)
+            token_pipeline = ab_pipeline
         tma_a_pipeline_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self._mainloop.num_ab_pipeline_stages
+            pipeline.PipelineUserType.Producer, self._mainloop.num_weight_ab_stages
         )
         tma_b_pipeline_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self._mainloop.num_ab_pipeline_stages
+            pipeline.PipelineUserType.Producer, self._mainloop.num_token_ab_stages
+        )
+        gather_b_pipeline_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self._mainloop.num_token_ab_stages
         )
         mma_pipeline_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self._mainloop.num_ab_pipeline_stages
+            pipeline.PipelineUserType.Consumer, self._mainloop.num_weight_ab_stages
+        )
+        mma_token_pipeline_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self._mainloop.num_token_ab_stages
         )
         acc_pipeline = self._mainloop.create_acc_pipeline(self._smem_workspace, smem_base)
         tmem_allocator = self._mainloop.create_tmem_allocator(
             self._smem_workspace, smem_base, allocator_warp_id=self.epilogue_warp_ids[0]
         )
         self.scheduler.assign_device_members(
-            expert_token_sizes=expert_token_sizes,
+            expert_token_sizes=scheduler_expert_sizes,
             expert_token_prefix_sum=None,
             actual_expert_shape=actual_expert_shape,
             block_idx=block_idx,
             smem_workspace=self._smem_workspace,
             smem_base=smem_base,
             device_workspace=self._device_workspace,
-            is_fallback_cluster=is_fallback_cluster,
         )
         scheduler = self.scheduler
 
         fc2_spin_threshold = (intermediate_gateup + self._mainloop.cta_tile_m - 1) // self._mainloop.cta_tile_m
+        # The scheduler enumerates slots, so the tile it produces has to be
+        # rewritten into an expert index before any consumer sees it: the weights,
+        # their scale factors, the per-expert alphas and the per-expert
+        # scale-factor gate all address an expert. The row offsets it also carries
+        # are already resolved and stay as they are.
+        expert_remap = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        # No FC1 ready counter: readiness is published per rank, not per tile, and
+        # the waits below cover it once per warp.
         kernel_extension = BlockScaledSwapAbFc12Extension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
-            fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
+            fc1_ready_counter_pointer=None,
+            expert_remap=expert_remap,
         )
         optional_epilogue_args = GatedActEpilogueArgs(
             fc1_alpha=fc1_alpha, fc2_alpha=fc2_alpha, fc1_norm_const=fc1_norm_const, topk_scores=pool_topk_scores
         )
 
-        pipeline_init_arrive_mixed_cga(
-            self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster, is_relaxed=True
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
+        self._mainloop.assign_device_members(
+            self._smem_workspace, smem_base, cta_coord_in_cluster, hidden, intermediate_gateup
         )
-        pipeline_init_wait_mixed_cga(
-            self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
-        )
-        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
-        finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         if warp_idx == self.scheduler_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.scheduler_register_count)
-            iket.range_push("mega.scheduler")
-            if cutlass.const_expr(hasattr(scheduler, "initialize_fallback_group")):
-                iket.range_push("scheduler.register_group")
-                scheduler.initialize_fallback_group()
-                iket.range_pop()
+            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
+            iket.range_push("genphase.scheduler")
             iket.range_push("scheduler.wait_sizes_ready")
-            self.token_comm.wait_for_sizes_ready(self._device_workspace)
+            # One helper CTA folds the per-rank counts into `expert_sizes` and
+            # publishes once, so the target is one rather than a derived count.
+            spin_wait(
+                self._device_workspace.ptr(self.token_comm.sizes_ready_region),
+                lambda value: value == Int32(1),
+                scope="gpu",
+            )
             iket.range_pop()
             iket.range_push("scheduler.gen_work")
             work_tile = scheduler.gen_next_work()
@@ -1021,7 +1046,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         if warp_idx == self.tma_a_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            iket.range_push("mega.tma_a")
+            iket.range_push("genphase.tma_a")
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_a(
                 fc1_tma_a_tensor=fc1_tma_a_tensor,
@@ -1041,42 +1066,62 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         if warp_idx == self.tma_b_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            iket.range_push("mega.tma_b")
+            iket.range_push("genphase.tma_b")
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_b(
-                fc1_tma_b_tensor=fc1_tma_b_tensor,
-                fc1_tma_b_atom_or_pair=fc1_tma_b_atom_or_pair,
                 fc1_tma_sfb_tensor=fc1_tma_sfb_tensor,
-                fc1_tma_sfb_atom_or_pair=fc1_tma_sfb_atom_or_pair,
+                fc1_tma_sfb_atom=fc1_tma_sfb_atom,
                 fc2_tma_b_tensor=fc2_tma_b_tensor,
-                fc2_tma_b_atom_or_pair=fc2_tma_b_atom_or_pair,
+                fc2_tma_b_atom=fc2_tma_b_atom,
                 fc2_tma_sfb_tensor=fc2_tma_sfb_tensor,
-                fc2_tma_sfb_atom_or_pair=fc2_tma_sfb_atom_or_pair,
-                ab_pipeline=ab_pipeline,
+                fc2_tma_sfb_atom=fc2_tma_sfb_atom,
+                ab_pipeline=token_pipeline,
                 ab_pipeline_state=tma_b_pipeline_state,
                 sched_consumer=sched_consumer,
                 kernel_extension=kernel_extension,
                 fc1_done_counter_pointer=fc1_done_counter.iterator,
                 fc2_spin_threshold=fc2_spin_threshold,
+                fc1_sf_ready_pointer=self._device_workspace.ptr(self.token_comm.fc1_sf_ready_region),
+                expert_sizes=self._device_workspace.tensor(self.token_comm.expert_sizes_region),
             )
             iket.range_pop()
 
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            iket.range_push("mega.mma")
+            iket.range_push("genphase.mma")
             sched_consumer = scheduler.make_consumer()
-            self._mainloop.run_mma(
-                tmem_allocator=tmem_allocator,
-                ab_pipeline=ab_pipeline,
-                ab_pipeline_state=mma_pipeline_state,
-                acc_pipeline=acc_pipeline,
-                sched_consumer=sched_consumer,
-            )
+            if cutlass.const_expr(self._mainloop.uses_asymmetric_ab_stages):
+                self._mainloop.run_mma_asymmetric(
+                    tmem_allocator=tmem_allocator,
+                    weight_pipeline=ab_pipeline,
+                    weight_pipeline_state=mma_pipeline_state,
+                    token_pipeline=token_pipeline,
+                    token_pipeline_state=mma_token_pipeline_state,
+                    acc_pipeline=acc_pipeline,
+                    sched_consumer=sched_consumer,
+                )
+            else:
+                self._mainloop.run_mma(
+                    tmem_allocator=tmem_allocator,
+                    ab_pipeline=ab_pipeline,
+                    ab_pipeline_state=mma_pipeline_state,
+                    acc_pipeline=acc_pipeline,
+                    sched_consumer=sched_consumer,
+                )
             iket.range_pop()
 
         if warp_idx < len(self.epilogue_warp_ids):
             cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
-            iket.range_push("mega.epilogue")
+            iket.range_push("genphase.epilogue")
+            iket.range_push("epilogue.wait_metadata_ready")
+            # FC1 reads the pool-aligned top-k scores and FC2 reads the routing
+            # records; both land with the same counter.
+            spin_wait(
+                self._device_workspace.ptr(self.token_comm.metadata_ready_region),
+                lambda value: value == Int32(self.token_comm.metadata_ready_target),
+                scope="gpu",
+            )
+            iket.range_pop()
             sched_consumer = scheduler.make_consumer()
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             tmem_allocator.wait_for_alloc()
@@ -1091,42 +1136,77 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc1_output_tma_atom,
                 fc1_output_tma_tensor,
                 fc1_output_sf,
-                fc2_output_tma_atom,
-                fc2_output_tma_tensor,
+                None,
+                None,
                 fc2_output,
                 fc1_done_counter,
                 thread_idx,
                 token_src_metadata,
-                fc2_done_counter,
-                fc2_output_sf,
+                None,
+                None,
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
-            iket.range_pop()
-            finalize_barrier.arrive_unaligned()
 
-        if warp_idx >= Int32(self.transfer_warp_idx_start):
+            epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
+
+            iket.range_push("tail.grid_sync_before_reset")
+            self.tail_barrier.sync(
+                epilogue_thread_count, Int32(self.promised_launchable_sm_count), linear_cta_idx, thread_idx
+            )
+            iket.range_pop()
+
+            iket.range_push("tail.reset_workspace")
+            total_reset_threads = self.promised_launchable_sm_count * epilogue_thread_count
+            global_reset_thread = linear_cta_idx * Int32(epilogue_thread_count) + thread_idx
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            iket.range_pop()
+
+            iket.range_push("tail.nvlink_publish")
+            self.tail_barrier.arrive_and_wait(
+                epilogue_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                linear_cta_idx,
+                thread_idx,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=False,
+            )
+            iket.range_pop()
+            iket.range_pop()
+
+        if (warp_idx >= Int32(self.gather_b_warp_ids[0])) & (warp_idx <= Int32(self.gather_b_warp_ids[-1])):
             cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
-            if warp_idx < Int32(self.token_in_end_warp_idx):
-                iket.range_push("mega.token_in")
-                self.token_comm.token_in(self._smem_workspace, smem_base)
-                iket.range_pop()
-                if cutlass.const_expr(
-                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"
-                ):
-                    iket.range_push("mega.token_back")
-                    self.token_comm.token_back(self._smem_workspace, smem_base)
-                    iket.range_pop()
-                finalize_barrier.arrive_and_wait()
-                iket.range_push("mega.tail_reset")
-                self.token_comm.reset_tail()
-                iket.range_pop()
-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
-                iket.range_push("mega.token_back_standalone")
-                self.token_comm.token_back(self._smem_workspace, smem_base)
-                iket.range_pop()
-                finalize_barrier.arrive_unaligned()
-        self.token_comm.remove_device_members()
+            iket.range_push("genphase.gather_b1")
+            iket.range_push("gather_b1.wait_input_ready")
+            # `gather_index` is local, published by this rank's sort workers; the
+            # payload flag is written by peers, hence the wider scope.
+            spin_wait(
+                self._device_workspace.ptr(self.token_comm.token_data_ready_region),
+                lambda value: value == Int32(self.token_comm.payload_ready_target),
+                scope="sys",
+            )
+            spin_wait(
+                self._device_workspace.ptr(self.token_comm.metadata_ready_region),
+                lambda value: value == Int32(self.token_comm.metadata_ready_target),
+                scope="gpu",
+            )
+            iket.range_pop()
+            sched_consumer = scheduler.make_consumer()
+            self._mainloop.run_tma_gather_b1(
+                fc1_tma_b_atom=fc1_tma_b_atom,
+                gather_index=gather_index,
+                ab_pipeline=token_pipeline,
+                ab_pipeline_state=gather_b_pipeline_state,
+                sched_consumer=sched_consumer,
+                gather_warp_idx=warp_idx - Int32(self.gather_b_warp_ids[0]),
+            )
+            iket.range_pop()
+
+        self.tail_barrier.remove_device_members()
         self._device_workspace.remove_device_members()
+
+
+__all__ = ["BlockScaledSwapAbGenphaseMoeKernel"]
