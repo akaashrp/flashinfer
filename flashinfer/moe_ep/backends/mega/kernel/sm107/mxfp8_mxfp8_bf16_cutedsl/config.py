@@ -41,11 +41,8 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # Mixed-CGA launch: fill leftover SMs with smaller fallback clusters
     # (e.g. preferred (4, 1) + fallback (2, 1)). None -> uniform launch.
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None
-    # Tuning-knob resolution: None -> the explicit fields above stand;
-    # a dict (shim knob keys, see kernel_src.sm107.next_cutedsl_megamoe.KNOB_KEYS)
-    # -> explicit overrides; "cache" -> knob-cache lookup (populated by
-    # `python -m flashinfer.moe_ep.tune`) with the built-in heuristic
-    # fallback. The SM100-style online "auto" sweep is NOT supported on the
-    # engine path (the SM107 session bakes knobs at construction).
+    # None preserves the fields above; a dict overrides KNOB_KEYS.
+    # "cache" uses an offline winner or the heuristic fallback. Online "auto"
+    # is unsupported because the kernel fixes its knobs at construction.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None

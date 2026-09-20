@@ -1,12 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Symmetric-heap + graph-capture utilities for the SM107 GLU mega frontend.
+"""Symmetric allocation and CUDA-graph helpers for Rubin MegaMoE.
 
-Mirrors ``kernel_src/sm100/cutedsl_megamoe/shim/comm.py`` (the SM100 tree) with the
-drop-specific ``src.bootstrap`` pieces removed: torch.distributed / NVSHMEM
-runtime bring-up for this tree is owned by ``flashinfer.moe_ep.core.runtime``
-(the backend declares the requirement); the shim only allocates on whatever
-heap is already up.
+The core runtime initializes torch.distributed and NVSHMEM. This module
+allocates from that heap and tracks allocation lifetime.
 """
 
 from __future__ import annotations

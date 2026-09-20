@@ -1,26 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Collective knob autotuning for the SM107 block-scaled mega kernel.
+"""Collective offline tuning for the SM107 block-scaled kernel.
 
-SM100 counterpart: ``cutedsl_megamoe/shim/autotune.py``.  The structural
-difference: the SM107 kernel bakes every knob into the session at
-construction (``BlockScaledSwapAbMegaMoeKernel`` + its device workspaces are
-built from the ImplDesc), so a candidate cannot be applied to a live session
-via ``apply_knobs``.  Each candidate instead builds a fresh
-:class:`.block_scaled.Sm107BlockScaledSymmBuffer`, copies the caller's staged
-inputs into it, times it, and destroys it.  The caller's session is left
-untouched; the winner is recorded in the knob cache (``.knob_cache``) for
-pure-lookup engine starts.
+Each candidate builds a session, copies the staged inputs, compiles and times
+its kernel, then destroys the session. The caller's workspace stays unchanged;
+the winner is saved in the knob cache for later backend construction.
 
-The tune is a COLLECTIVE operation: dispatch/combine span all EP ranks, so
-every rank must call the autotune entry point with the same candidate list
-(order included).  Ranks build and launch each candidate in lockstep and the
-winner is agreed on by all-reducing per-candidate times with MAX (the slowest
-rank is the real latency of a collective kernel).
-
-Cost: one ``cute.compile`` + one symmetric-heap workspace build per
-candidate, paid offline (``python -m flashinfer.moe_ep.tune``).  Narrow
-``candidates`` to trade quality for sweep time.
+All EP ranks must use the same candidates in the same order. Timing takes the
+maximum rank duration for each sample, then the median across samples.
 """
 
 from __future__ import annotations

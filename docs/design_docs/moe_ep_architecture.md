@@ -1,7 +1,7 @@
 # moe_ep Design
 
-**Scope**: architecture of the `flashinfer.moe_ep` expert-parallel MoE
-subsystem — layers, backends, vendored kernel trees, and their contracts.
+`flashinfer.moe_ep` implements expert-parallel MoE layers, communication
+backends, and fused kernels.
 
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
@@ -114,10 +114,12 @@ flowchart TD
 The knobs split into two classes (`kernel_src/sm100/cutedsl_megamoe/shim/tuner.py`):
 
 - **correctness knobs** change a code path or the output and must be kept at
-  the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
-  `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
-  `in_kernel_fc2_reduce` (ikr — makes the accumulation order
-  nondeterministic; pin `False` for bit-reproducibility);
+the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
+`token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
+`in_kernel_fc2_reduce` (ikr — makes the accumulation order
+nondeterministic); the knobs may select it, but only when the config sets
+`enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce`
+at `False` keeps the session bit-reproducible.
 - **perf knobs** are output-neutral and free to sweep: `group_hint`,
   `flag_batch`, `epi_flag_batch`.
 
@@ -127,7 +129,7 @@ compilable combinations.
 
 ### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
 
-**1. Default (`knobs=None`).** The session resolves the knob cache first;
+**1. Default (**`knobs=None`**).** The session resolves the knob cache first;
 on a miss it falls back to four measured token-count profiles keyed on the
 compile-time buffer capacity (`max_tokens_per_rank * world`):
 
@@ -138,7 +140,9 @@ compile-time buffer capacity (`max_tokens_per_rank * world`):
 | 1024–2047 | mid-large: 256-wide N tile, `standalone_warps` |
 | ≥ 2048 | large throughput: `flag_batch=8`, `reuse_dispatch_warps` |
 
-**2. Pinned (`knobs=dict`).** E.g. a winner from the kernel team's tester
+`in_kernel_fc2_reduce` defaults to the value of `enable_in_kernel_fc2_reduce`
+
+**2. Pinned (**`knobs=dict`**).** E.g. a winner from the kernel team's tester
 sweep:
 
 ```python
@@ -152,7 +156,7 @@ Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
 )
 ```
 
-**3. Online (`knobs="auto"`).** At the first `compute()` every rank runs the
+**3. Online (**`knobs="auto"`**).** At the first `compute()` every rank runs the
 same ~24-candidate sweep (`nvfp4_candidates()`: tile {256×128, 256×256} ×
 `flag_batch` {4, 8} × three `token_back_mode` values × ikr {off, on}, over a
 fixed base of `cluster (2,1,1)`, `group_hint 512`, `epi_flag_batch (2,4)`,
@@ -192,7 +196,7 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
+  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
@@ -208,9 +212,10 @@ moe_ep/
   kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
     shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
-  kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin (SM107) "next" greenfield tree, inference-only so far
-    src/                       ← drop subtree (sources/), see VENDOR.md for the recorded inline diffs
-    shim/, __init__.py, VENDOR.md, TUNING.md  ← same layering; TUNING.md carries the SM107 knob/perf notes
+  kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin block-scaled inference
+    src/sources/               ← verbatim upstream exporter output; see VENDOR.md
+    shim/, __init__.py          ← FlashInfer adapters and public package API
+    VENDOR.md, SKILL.md, TUNING.md  ← provenance, update procedure, and measurements
   modes/{split_layer,mega_layer,config}.py
 ```
 

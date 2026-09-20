@@ -1,26 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Persistent knob cache for the SM107 block-scaled mega kernel.
+"""Persistent tuning cache for the SM107 block-scaled kernel.
 
-Same file format, version, and location as the SM100 tree's
-``cutedsl_megamoe/shim/knob_cache.py`` (the two trees are process-exclusive,
-so the module is reimplemented here rather than imported): winners land in a
-small JSON file keyed by (device, dtype, world_size, geometry, combine wire,
-token-bucket), and knob resolution is a pure dict lookup — no compiles, no
-collectives. The ``device`` key has an ``sm107:`` prefix so older SM100
-readers cannot match entries even when GPU model names are identical.
-Implementation revision, nondeterminism permission, and early/late
-routing-weight policy must also match.
+The JSON format and file location are shared with SM100. An ``sm107:`` device
+prefix keeps the architectures' entries separate. Implementation revision,
+quantization, EP size, geometry, combine format, nondeterminism permission,
+and routing-weight policy must match.
 
-Populate with the offline CLI (``python -m flashinfer.moe_ep.tune`` on a
-Rubin node) — see ``.autotune`` for the collective sweep.
+Populate entries with ``python -m flashinfer.moe_ep.tune``. Set
+``FLASHINFER_MOE_EP_KNOB_CACHE`` to a path, or ``0``/``off`` to disable it;
+the default is ``~/.cache/flashinfer/moe_ep_knob_cache.json``.
 
-File location: ``FLASHINFER_MOE_EP_KNOB_CACHE`` (a path, or ``0``/``off`` to
-disable), default ``~/.cache/flashinfer/moe_ep_knob_cache.json``.
-
-``max_tokens`` is the session buffer capacity; lookup picks the exact bucket
-when present, else the smallest recorded bucket >= the requested size, else
-the largest below it.  All other key fields must match exactly.
+``max_tokens`` is workspace capacity. Lookup prefers the exact bucket, then
+the smallest larger bucket, then the largest smaller bucket.
 """
 
 from __future__ import annotations

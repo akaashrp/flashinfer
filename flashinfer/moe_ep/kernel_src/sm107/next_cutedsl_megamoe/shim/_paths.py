@@ -1,16 +1,8 @@
-"""Put ``kernel_src/sm107/next_cutedsl_megamoe/src`` on ``sys.path`` so ``sources`` resolves.
+"""Expose the vendored ``sources`` package through the sibling ``src/`` directory.
 
-This is shim glue, not kernel-team code, so it lives in ``shim/`` (never inside
-``src/`` — that directory is a *verbatim* drop from the kernel team).  It adds
-the sibling ``src/`` directory to ``sys.path`` so the drop's single top-level
-package (``sources``) imports without a separate editable install.
-
-Unlike the SM90/SM100 fork pair (which share ``common``/``src``/
-``moe_nvfp4_swapab`` top-level names and are mutually exclusive per process),
-the ``next/`` greenfield tree ships only the ``sources`` package with fully
-relative imports, so this tree does NOT collide with the sibling trees.  The
-guard below still protects against a foreign ``sources`` module (a generic
-name) already owning the process.
+Rubin uses relative imports under ``sources``, so it can coexist with the
+SM90/SM100 package names. Reject an unrelated ``sources`` package already
+loaded in this process.
 """
 
 from __future__ import annotations

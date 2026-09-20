@@ -1,11 +1,4 @@
-"""Offline knob tuner for the SM107 nvfp4 block-scaled mega kernel.
-
-Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim (``--arch sm107
---dtype nvfp4``).  Thin quant-kind binding over the shared SM107 driver in
-``backends/mega/kernel/sm107/tuning.py``; the candidate space and the
-rebuild-per-candidate collective sweep live in
-``kernel_src/sm107/next_cutedsl_megamoe/shim/autotune.py``.
-"""
+"""NVFP4 entry point for the shared SM107 offline tuner."""
 
 from __future__ import annotations
 

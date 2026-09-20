@@ -1,8 +1,7 @@
 # Vendoring record: next_cutedsl_megamoe
 
-One `kernel_src/` directory = one upstream kernel repo snapshot. This file
-records **provenance and sync state**; the drop-update workflow lives in
-[SKILL.md](SKILL.md), and measurement conventions live in [TUNING.md](TUNING.md).
+This directory contains one upstream kernel snapshot.
+[SKILL.md](SKILL.md) describes updates; [TUNING.md](TUNING.md) covers measurements.
 
 ## Upstream
 
@@ -59,8 +58,7 @@ and workspace code are from the same pinned snapshot.
 `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is included
 in the vendored export for future integration. It is not yet selectable through
 the FlashInfer backend or benchmark. Upstream SiTU activation parameters are also
-not exposed by the current wrapper. Vendored capability does not imply public
-API support or native qualification of a new path.
+not exposed by the current wrapper.
 
 `+combine_nvfp4` and `+combine_mxfp8` remain future FlashInfer configuration,
 workspace/scale handling, correctness and measurement work. Their device paths
@@ -82,10 +80,10 @@ the older drop. This export passed native single-GPU (50 cases) and EP4
 Rubin stack, followed by all 420 planned benchmark records on September 18,
 2026. See the [results](../../../../../docs/design_docs/moe_ep_sm107_results.md)
 and [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-EP2/EP8 on this refreshed export remain unmeasured. Tuning-cache entries use the new backend revision
+EP2/EP8 on this export remain unmeasured. Tuning-cache entries use revision
 `sm107-block-scaled-1667b47a-v3`, so the previous drop's timings are not reused.
 
-## Export transformations and pending local diffs
+## Export transformations
 
 There are **no handwritten changes** to the export. Upstream's exporter
 materializes three `COPY_FROM_IMPORT` markers at the pinned commit:

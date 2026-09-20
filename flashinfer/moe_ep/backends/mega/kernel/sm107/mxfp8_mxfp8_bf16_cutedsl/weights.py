@@ -65,7 +65,6 @@ def preprocess_mega_weights(
             "bf16/fp32 weights."
         )
 
-    # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         preprocess_block_scaled_weights,
     )

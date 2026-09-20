@@ -69,7 +69,7 @@ meant to compare against the reference tables.
 
 History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
 every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
-`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
 `kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
@@ -244,30 +244,21 @@ process (the SM90/SM100 kernel trees are mutually exclusive per process):
 
 ### SM107 (Rubin) mega tests
 
-Rubin-only (`sm107_{mxfp8_mxfp8,nvfp4_nvfp4}_bf16_cutedsl`, the
-`next_cutedsl_megamoe` inference
-drop) targets, also in their own pytest processes:
-`bash tests/moe_ep/run_tests.sh oracle_sm107` (1 GPU, `MEGA_NO_DIST=1`) and
-`bash tests/moe_ep/run_tests.sh mega_sm107` (`NPROC_MULTIRANK=2`, `4`, or `8`,
-default 4). Both cover NVFP4, MXFP8 E4M3, and MXFP8 E5M2. Tests are gated on the
-`arch_rubin` marker (auto-skip unless compute capability == 10.7); the sm100
-`arch_blackwell` tests conversely auto-skip ON Rubin hosts.
-
-For merge qualification, use the stricter entry point:
+The Rubin suites cover NVFP4 and MXFP8 E4M3/E5M2 on compute capability 10.7.
+Use the strict runner to collect per-rank results and fail on skips, OOMs,
+empty selections, or timeouts:
 
 ```bash
 export CUTE_DSL_ARCH=sm_107a
 python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
-  --output-dir /tmp/sm107-ep4
+  --output-dir "${FI_RESULTS:?}/sm107-ep4"
 ```
 
-This rejects skips, OOMs, an empty test selection, incompatible compiler
-targets, and non-Rubin GPUs. It saves per-rank JUnit and process logs and
-terminates the whole job on timeout. See the [SM107 qualification
-runbook](moe_ep_sm107_qualification.md) for reproduction commands and declared
-coverage limits. The refreshed export's single-GPU/EP4 correctness and agreed
-performance matrix are [complete](moe_ep_sm107_results.md); additional topology,
-sanitizer, or packaging checks are separate from those completed runs.
+For individual suites, use `bash tests/moe_ep/run_tests.sh oracle_sm107`
+(single GPU) or `NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107`.
+The distributed target also accepts 2 or 8 ranks. See the
+[validation guide](moe_ep_sm107_qualification.md) and
+[completed single-GPU/EP4 results](moe_ep_sm107_results.md).
 
 ### Hopper performance benchmark
 
@@ -305,13 +296,19 @@ end-to-end** suite (`vllm_e2e/`). Clone it beside your flashinfer checkout:
 export ROOT=/path/to            # parent dir; hold both checkouts here
 cd "$ROOT"
 git clone https://github.com/mhoqueanik/moe_ep_benchmark.git
+# pin the revision the published numbers were run with (vllm-pr branch,
+# "Add 2026-07-22 cutlass-dsl 4.5.2 validation results" — scripts + result CSVs)
+git -C moe_ep_benchmark checkout c8aefda
 # $ROOT now has both flashinfer-2/flashinfer-moe_ep and moe_ep_benchmark/
 ```
 
-All numbers below were measured on **4× GB200 (SM100)** at the `4_5_2-perf-fix`
-branch tip on **nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own pin; at 4.6.1
-parity since the MR!27 mainloop WAR — see
-[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md)).
+All numbers below were measured on **4× GB200 (SM100)** at the tip of this
+tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
+(vLLM 0.25.1's own pin) — the measured and supported baseline. 4.6.1 appears
+below only as a parity *reference*: the MR!27 mainloop WAR brings 4.5.2 to
+4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
+unsupported (4.5.0 fails at `cute.compile`) — see
+[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -531,9 +528,8 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
   (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
 - `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
-  greenfield tree (the block-scaled swap-AB inference kernel only so far;
-  other archs/kernels from the same tree migrate into this directory later —
-  see its `VENDOR.md`)
+  block-scaled inference export; generic inference is integrated, with
+  GenPhase included for future integration (see its `VENDOR.md`)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
@@ -568,7 +564,8 @@ def get_symm_buffer_for_<name>_mega_moe(
     world_size: int,            # self.ep_world_size
     *,
     kind=...,                   # dtype selector, if applicable
-    # ... kernel knobs: clamps, in_kernel_fc2_reduce, token_back_by_dispatch, ...
+    # ... session params: clamps, enable_in_kernel_fc2_reduce, ...
+    knobs=...,                  # tile/schedule/token-back tactics, or None
 ) -> <Name>SymmBuffer: ...
 ```
 

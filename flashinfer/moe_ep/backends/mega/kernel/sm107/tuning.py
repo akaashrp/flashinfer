@@ -1,19 +1,8 @@
-"""Shared offline-tuning driver for the SM107 block-scaled mega backends.
+"""Offline tuning shared by the SM107 NVFP4 and MXFP8 backends.
 
-SM100 counterpart: the per-backend ``sm100/<name>/tuner.py`` pair over
-``backends/mega/kernel/tuning.py``.  The SM107 backends share one driver
-because both talk to the same quant-kind-generic shim
-(``kernel_src/sm107/next_cutedsl_megamoe``); the per-backend ``tuner.py`` modules
-are thin quant-kind bindings invoked through the
-:mod:`flashinfer.moe_ep.tune` CLI (``--arch sm107``).
-
-Differences from the SM100 driver:
-
-- the dist lifecycle uses the moe_ep core runtime bootstrap (the next tree's
-  shim has no ``init_dist``; NVSHMEM + torch.distributed come from
-  ``bootstrap_moe_ep_runtime``), with ``MEGA_NO_DIST=1`` single-rank support;
-- each candidate rebuilds the kernel session (SM107 bakes knobs at
-  construction — see ``kernel_src/sm107/next_cutedsl_megamoe/shim/autotune.py``).
+The core runtime owns torch.distributed and NVSHMEM initialization.
+Each candidate needs a new session because kernel knobs are fixed at
+construction. ``MEGA_NO_DIST=1`` selects single-rank execution.
 """
 
 from __future__ import annotations
@@ -153,8 +142,7 @@ def tune_one(
     try:
         transformed = _dummy_transformed_weights(args, rank, world_size, quant_kind)
         l1, l2 = transformed
-        # The base session is a staging source + geometry holder only — its
-        # own kernel is never launched (each candidate builds a fresh one).
+        # Candidates copy inputs from this session; its kernel is never launched.
         symm_buffer = get_symm_buffer_for_sm107_block_scaled_mega_moe(
             args.num_experts,
             max_tokens,
@@ -217,7 +205,7 @@ def tune_one(
 
 
 def run_tuning(args, quant_kind: str) -> int:
-    """Dist lifecycle + per-bucket sweep loop (SM107 core-runtime flavor)."""
+    """Initialize the runtime and tune each token-capacity bucket."""
     import torch
 
     if args.combine_dtype != "bf16":

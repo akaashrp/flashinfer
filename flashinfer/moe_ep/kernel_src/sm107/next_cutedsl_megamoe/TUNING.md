@@ -11,20 +11,17 @@ Qualify correctness first using the [Rubin runbook](../../../../../docs/design_d
 All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. The original PR's internal-build performance claims are not a
-baseline for this rebased implementation. Record the measured compiler stack
-and absolute latency; a vendor-build result does not qualify the minimum public
-compiler version.
+baseline for this implementation. Record the compiler stack and absolute
+latency with each result.
 
 ## Completed EP4 campaign
 
-The agreed matrix completed on September 18, 2026 at FlashInfer `5bd5aeef`:
-**84/84 compute-reference records and 336/336 kernel/forward records passed**
-on one four-GPU Rubin node with the prepared ARM PyTorch image. Single-GPU and
-EP4 correctness passed before perf. The [results, runtime pins, and repetition
-ranges](../../../../../docs/design_docs/moe_ep_sm107_results.md) cover both
-geometries, seven token counts, separate BF16 reduction and IKR, with the
-protocol below. No points remain pending in this matrix. GenPhase, SiTU,
-`combine_nvfp4`, and `combine_mxfp8` remain future integration work.
+At FlashInfer `5bd5aeef`, all 84 compute-reference records and 336
+kernel/forward records passed on September 18, 2026. Runs used four Rubin GPUs
+and the prepared ARM PyTorch image, after single-GPU and EP4 correctness passed.
+The [results and repetition ranges](../../../../../docs/design_docs/moe_ep_sm107_results.md)
+cover both geometries, seven token counts, separate BF16 reduction, and IKR.
+GenPhase, SiTU, `combine_nvfp4`, and `combine_mxfp8` are future integration work.
 
 ## What the benchmark measures
 
@@ -112,7 +109,7 @@ Engine configuration has the same distinction: `knobs=None` preserves
 explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
 and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
 
-## Qualification workload selection
+## Benchmark workloads
 
 The primary historical Blackwell-table comparison uses EP4, NVFP4 activations
 and weights with BF16 combine, and **both** geometries:
@@ -194,16 +191,13 @@ their `e2e_pipelined` mode. The [linked harness](https://github.com/mhoqueanik/m
 reuses its output and flushes L2 on every timed iteration. Match that protocol
 with `--mode compute --execution eager --warmup 20 --iters 50`, leaving L2
 flushing enabled, and compare `p50_rank0_us`. Match geometry, live/capacity
-counts, routing and other conditions too; this protocol does not make unlike
-workloads comparable. No new Blackwell regression run is part of this campaign.
+counts, routing, and input distributions as well.
 Rubin's `max_rank_p50_us` now uses the same rank aggregation as the Blackwell
 autotuner. The autotuner times synchronized host wall-clock calls; this
 benchmark uses CUDA events, so matching aggregation alone does not make
 their absolute latencies comparable.
 Do not treat old Blackwell numbers as Rubin acceptance thresholds.
-The harness does not print ratios against hard-coded latencies. Report the
-Torch staging cost explicitly before deciding whether fused staging is a
-merge requirement or a follow-up.
+Report Torch staging cost separately when evaluating a fused staging implementation.
 
 ## Offline tuning
 

@@ -27,7 +27,7 @@ kernel_src/sm107/next_cutedsl_megamoe/
 └── TUNING.md               ← tuning and benchmark conventions
 ```
 
-Core principle: **keep `src/` byte-for-byte equal to the pinned upstream export**.
+**Keep `src/` byte-for-byte equal to the pinned upstream export.**
 Record the exporter revision, selected kernels and generated transformations in
 `VENDOR.md`. Fix device/exporter code upstream and re-export; put FlashInfer
 adaptation in `shim/` and the backend wrappers.
@@ -84,8 +84,8 @@ sha256sum next/export_src.py
 ```
 
 The current selection includes the generic and GenPhase inference kernels;
-GenPhase is vendored for a separate FlashInfer integration. Do not select training
-or local fused-routing kernels unless the active task needs those integrations.
+GenPhase is vendored for a separate FlashInfer integration. Select additional
+kernels when their FlashInfer integration is included in the update.
 The export may include dependencies from other kernel families; record their
 source mappings rather than manually removing them.
 
@@ -152,9 +152,8 @@ across incompatible precision, routing-weight or reduction policies.
 wrapper selects BF16 combine. Exposing the existing quantized-combine paths
 requires configuration, correctly sized payload/scale buffers, reduction and
 output handling, cache/pool identities, numerical tests and benchmark variants.
-Determine whether a device-kernel change is needed from the actual contract;
-do not assume that changing only the format string is sufficient. Keep these
-variants separate from BF16 combine and `+ikr` in performance reports.
+Check those requirements against the upstream kernel interface. Report each
+combine format as a separate variant alongside BF16 combine and `+ikr`.
 
 ### 6. Validate the changed implementation
 
@@ -171,19 +170,16 @@ python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
 ```
 
 `oracle_sm107` and `mega_sm107` in `tests/moe_ep/run_tests.sh` are alternative
-entry points for the same native test files; do not repeat them after an
-equivalent strict run. Choose EP2/8, sanitizer, lifecycle, subgroup or installed-
-package checks when the changes and support claims need them; see the
-[qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
-for commands. A Rubin drop update does not itself require Blackwell compatibility
-testing. Isolate negative CUDA tests and terminate all ranks after a CUDA failure.
+entry points for the same native test files. Choose the suite and EP size for
+the changed code; the [validation guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
+also has sanitizer and installed-package commands. Isolate negative CUDA tests
+and terminate all ranks after a CUDA failure.
 
 Measure affected workloads using `TUNING.md` and the active experiment plan.
 Retain absolute latency, raw samples, resolved config, timing/cache scope and
 source/environment identity. Existing benchmark numerical and configuration
-checks validate measured points. Documentation-only changes require document
-checks, not new native runs; do not reopen completed qualification or add an
-extra standalone smoke before perf without a concrete uncovered change.
+checks validate measured points. Reuse existing results when the implementation,
+environment, and workload are unchanged. Check links and commands for documentation edits.
 
 ### 7. Update the record and review the diff
 

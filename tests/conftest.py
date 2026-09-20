@@ -1,5 +1,6 @@
 import json
 import os
+import traceback
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -240,9 +241,7 @@ def pytest_collection_modifyitems(config, items):
                 # (the sm120 kernel drop's bootstrap maps
                 # local_rank % device_count and supports MEGA_SINGLE_GPU_GLOO).
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
-        # Blackwell band only: SM107 (Rubin, cc 10.7) is NOT a superset of the
-        # sm_100 kernel targets — Blackwell-marked tests fail there (ptxas /
-        # DSL target mismatch), so they skip gracefully instead.
+        # SM100 kernels cannot compile for Rubin (10.7).
         if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
             item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
         # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
@@ -262,6 +261,33 @@ def is_cuda_oom_error_str(e: str) -> bool:
     return "CUDA" in e and "out of memory" in e
 
 
+def _release_cuda_oom(e: BaseException) -> bool:
+    """Return whether ``e`` or a linked exception is a CUDA OOM; if so, free its frames.
+
+    torch.testing.assert_close re-raises an OOM from inside its comparison as a
+    RuntimeError caused by the OOM, so both ``__cause__`` and ``__context__`` are
+    followed. The skip exception keeps these exceptions alive, and their
+    tracebacks would keep the test's frames and GPU tensors allocated into the
+    tests that follow.
+    """
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [e]
+    while pending:
+        x = pending.pop()
+        if x is None or any(x is seen for seen in chain):
+            continue
+        chain.append(x)
+        pending += [x.__cause__, x.__context__]
+    if not any(
+        isinstance(x, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(x))
+        for x in chain
+    ):
+        return False
+    for x in chain:
+        traceback.clear_frames(x.__traceback__)
+    return True
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item):
     # skip OOM error and missing JIT cache errors
@@ -270,7 +296,7 @@ def pytest_runtest_call(item):
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         if os.environ.get("FLASHINFER_STRICT_MOE_EP_TESTS") == "1":
             raise
-        if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
+        if _release_cuda_oom(e):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):
             # Record the test that was skipped due to missing JIT cache

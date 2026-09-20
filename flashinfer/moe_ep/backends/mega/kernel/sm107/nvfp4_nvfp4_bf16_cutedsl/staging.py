@@ -20,7 +20,6 @@ def stage_mega_moe_inputs(
     yet; quantizes with norm_const=1.0, matching the weight transform).
     Returns the staged token count.
     """
-    # Backend talks only to the next_cutedsl_megamoe shim (never src/ directly).
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
@@ -30,8 +29,7 @@ def stage_mega_moe_inputs(
     num_tokens, hidden = hidden_states.shape
     capacity = x_nvfp4.shape[0]
     if num_tokens == 0:
-        # A zero-token step still owns the buffer: rows a previous batch left
-        # routed must be re-masked or they would dispatch as stale live tokens.
+        # Clear old routes even when this batch has no live tokens.
         topk_idx_out.fill_(-1)
         return 0
     if topk_weights.shape != topk_ids.shape:

@@ -1,11 +1,7 @@
-"""SM107 (Rubin) nvfp4 block-scaled mega-MoE kernel backend.
+"""SM107 NVFP4 MegaMoE backend.
 
-Wraps the vendored ``kernel_src/sm107/next_cutedsl_megamoe`` drop's fused
-dispatch + FC1 + SwiGLU + FC2 + combine inference kernel
-(``BlockScaledSwapAbMegaMoeKernel`` at quant kind nvfp4) behind the
-``MegaKernelBackend`` contract.  The backend talks only to the drop's package
-``__init__`` (never ``src/`` directly), keeping ``import flashinfer.moe_ep``
-CPU-safe.
+Calls the Rubin package API for fused dispatch, both GEMMs, and combine.
+CUDA and CuTe DSL imports are deferred until the backend is used.
 """
 
 from __future__ import annotations
@@ -41,8 +37,7 @@ if TYPE_CHECKING:
 class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     """Fused Rubin nvfp4 block-scaled inference MoE over the NVLink symmetric heap."""
 
-    # compute(output=None) returns a workspace view (same contract as the
-    # sm100 cutedsl backends; upstream capability flag from the TOT merge).
+    # compute(output=None) returns a view into the workspace.
     supports_output_view = True
 
     def __init__(self, config: Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
@@ -225,8 +220,6 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Backend talks only to the next_cutedsl_megamoe shim (never src/
-        # directly).
         from ......kernel_src.sm107.next_cutedsl_megamoe import (
             sm107_block_scaled_mega_moe,
         )

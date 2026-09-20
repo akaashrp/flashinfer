@@ -1,6 +1,6 @@
-# Rubin MegaMoE qualification and performance results
+# Rubin MegaMoE results
 
-## Scope and provenance
+## Setup
 
 Measured September 18, 2026 on the refreshed generic inference kernel:
 
@@ -21,7 +21,7 @@ The [qualification guide](moe_ep_sm107_qualification.md) describes the contracts
 and rerun commands. The [tuning guide](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
 defines the timing boundaries and exact benchmark options.
 
-## Correctness and completed jobs
+## Tests and benchmark runs
 
 | Evidence | Result |
 | --- | --- |
@@ -96,9 +96,9 @@ Metric: maximum of per-rank p50s (`max_rank_p50_us`). Each cell is **BF16 / +IKR
 | 4096 | 1,071.4 / 572.8 | 1,066.3 / 571.3 | 7,847.6 / 7,346.0 | 7,766.4 / 7,268.4 |
 | 8192 | 1,828.5 / 834.8 | 1,822.5 / 833.5 | 15,304.6 / 14,310.7 | 15,241.0 / 14,252.4 |
 
-Source: [measurement CSV](moe_ep_sm107_results.csv); includes min/max across repetitions and both latency statistics. All 420 runs passed benchmark numerical and reporting checks.
+Source: [measurement CSV](moe_ep_sm107_results.csv); includes min/max across repetitions and both latency statistics. All 420 records passed benchmark numerical and reporting checks.
 
-## Interpretation and limits
+## Observations and limitations
 
 IKR reduces latency across all measured reference points. The full public
 forward path includes Torch input staging: at 8192 tokens/rank, graph forward
