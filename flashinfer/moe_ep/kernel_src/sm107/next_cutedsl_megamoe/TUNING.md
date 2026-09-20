@@ -11,8 +11,20 @@ Qualify correctness first using the [Rubin runbook](../../../../../docs/design_d
 All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. The original PR's internal-build performance claims are not a
-baseline for this rebased implementation; rerun on the supported public
-compiler and retain absolute measurements.
+baseline for this rebased implementation. Record the measured compiler stack
+and absolute latency; a vendor-build result does not qualify the minimum public
+compiler version.
+
+## Completed EP4 campaign
+
+The agreed matrix completed on September 18, 2026 at FlashInfer `5bd5aeef`:
+**84/84 compute-reference records and 336/336 kernel/forward records passed**
+on one four-GPU Rubin node with the prepared ARM PyTorch image. Single-GPU and
+EP4 correctness passed before perf. The [results, runtime pins, and repetition
+ranges](../../../../../docs/design_docs/moe_ep_sm107_results.md) cover both
+geometries, seven token counts, separate BF16 reduction and IKR, with the
+protocol below. No points remain pending in this matrix. GenPhase, SiTU,
+`combine_nvfp4`, and `combine_mxfp8` remain future integration work.
 
 ## What the benchmark measures
 

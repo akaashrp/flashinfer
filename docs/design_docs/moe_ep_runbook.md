@@ -264,8 +264,10 @@ python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
 This rejects skips, OOMs, an empty test selection, incompatible compiler
 targets, and non-Rubin GPUs. It saves per-rank JUnit and process logs and
 terminates the whole job on timeout. See the [SM107 qualification
-runbook](moe_ep_sm107_qualification.md) for the EP2/4/8, sanitizer,
-benchmark, packaging, and upstream acceptance matrix.
+runbook](moe_ep_sm107_qualification.md) for reproduction commands and declared
+coverage limits. The refreshed export's single-GPU/EP4 correctness and agreed
+performance matrix are [complete](moe_ep_sm107_results.md); additional topology,
+sanitizer, or packaging checks are separate from those completed runs.
 
 ### Hopper performance benchmark
 

@@ -77,9 +77,12 @@ The shim checks capabilities and the target captured at import.
 
 The older `92dd334` payload passed integration correctness at FlashInfer revision
 `9a414e73c8f4246746b281f98db2217a515819cb`, including EP2/4/8. That evidence is for
-the older drop. Record new validation against this export and its actual stack;
-the [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
-describes the tools. Tuning-cache entries use the new backend revision
+the older drop. This export passed native single-GPU (50 cases) and EP4
+(16 cases per rank) correctness at FlashInfer `5bd5aeef` on the recorded ARM
+Rubin stack, followed by all 420 planned benchmark records on September 18,
+2026. See the [results](../../../../../docs/design_docs/moe_ep_sm107_results.md)
+and [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
+EP2/EP8 on this refreshed export remain unmeasured. Tuning-cache entries use the new backend revision
 `sm107-block-scaled-1667b47a-v3`, so the previous drop's timings are not reused.
 
 ## Export transformations and pending local diffs

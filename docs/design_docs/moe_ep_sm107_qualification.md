@@ -4,11 +4,24 @@ The SM107 backends expose NVFP4, MXFP8 E4M3, and MXFP8 E5M2 inference through
 `MoEEpLayer`. The current generic implementation is the upstream `1667b47a`
 export, pinned in [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md).
 The bundled GenPhase entry point is not yet exposed by these backends.
-Earlier native results on PR #4601's `92dd334` snapshot do not qualify a new
-device-code drop. The Blackwell code is retained under `kernel_src/sm100/cutedsl_megamoe`,
-including BF16 support added after the original PR. The following evidence
-is required for a merge. Host tests and measurements on Blackwell do not
-establish Rubin kernel correctness or performance.
+The Blackwell code is retained under `kernel_src/sm100/cutedsl_megamoe`,
+including BF16 support added after the original PR.
+
+## Completed qualification — September 18, 2026
+
+At FlashInfer `5bd5aeef60c44a99341e6b6a183968d73bf582e7`, the refreshed export
+passed 50 single-GPU cases and 16 distributed cases on each of four ranks,
+with zero failures, errors, or skips. The agreed EP4 performance campaign also
+completed: 84 compute-reference records and 336 kernel/forward records, each
+passing its numerical and reporting checks. See the [results and pinned
+runtime](moe_ep_sm107_results.md) for tables and evidence identifiers.
+
+These runs complete the agreed single-GPU/EP4 correctness and performance
+scope. The commands below reproduce that evidence or extend coverage after a
+relevant change; they are not an outstanding list of runs. Current-export EP2
+and EP8, clean installed-wheel native tests, native sanitizer runs, and the
+minimum public compiler stack remain unmeasured. Earlier EP2/4/8 results on
+PR #4601's `92dd334` snapshot apply only to that older drop.
 
 ## Environment and installation
 
@@ -34,8 +47,10 @@ substitute for the native Rubin MMA helpers used here.
 The local integration checks used Python 3.10, Torch 2.14.0+cu130, CUDA
 toolkit 13.2, CUDA Python 13.4.1, CuTe DSL 4.8.0.dev0, and NVSHMEM4py-cu13
 0.3.1 on SM100. This records the portable test environment, not a certified
-Rubin combination. Pin the actual Rubin combination after the native tests
-below pass, then also test the intended minimum supported combination.
+Rubin combination. The completed native runs used the ARM PyTorch Rubin
+0.8dev stack pinned in the [results](moe_ep_sm107_results.md). They do not
+establish native correctness on the minimum public CuTe DSL build; validate
+that build separately before claiming coverage for it.
 
 ## Supported contracts
 
@@ -79,7 +94,7 @@ training, local fused-routing MegaMoE, MXFP4, mixed W4A8, and cross-node
 communication are not part of this implementation. A fused activation
 staging kernel is a performance follow-up; measure the Torch fallback.
 
-## Required correctness and lifecycle runs
+## Reproducing correctness and lifecycle coverage
 
 The existing `tests/moe_ep/run_tests.sh` targets from PR #4601 remain the
 direct entry points for native Rubin testing. From the repository root,
@@ -114,15 +129,14 @@ not count as qualification.
 
 ```bash
 export CUTE_DSL_ARCH=sm_107a
-python tests/moe_ep/qualify_sm107.py --suite all --world-size 2 --output-dir /tmp/sm107-ep2
-python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 --output-dir /tmp/sm107-ep4
-python tests/moe_ep/qualify_sm107.py --suite all --world-size 8 --output-dir /tmp/sm107-ep8
+: "${FI_RESULTS:?Set a fresh persistent results directory}"
+python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 --output-dir "$FI_RESULTS/ep4"
 ```
 
 The shell runner also exposes the strict `--suite all` command:
 
 ```bash
-NPROC_MULTIRANK=4 SM107_RESULTS_DIR=/tmp/sm107-ep4 \
+NPROC_MULTIRANK=4 SM107_RESULTS_DIR="$FI_RESULTS/ep4" \
   bash tests/moe_ep/run_tests.sh qualify_sm107
 ```
 
@@ -130,9 +144,10 @@ This is an alternative to the corresponding Python command, not an
 additional suite. Use the Python command to select individual suites,
 sanitizers, or installed-package testing.
 
-Use `--suite single` on a one-GPU Rubin host. If EP8 hardware is unavailable,
-state that limitation and bound the claimed support to the configurations
-actually qualified. Do not mark that row passed or silently skip it.
+Use `--suite single` on a one-GPU Rubin host. EP2 and EP8 can be selected
+with `--world-size 2` or `8` for separate scaling/coverage work; neither is
+pending in the agreed EP4 campaign. Bound qualification claims to the
+configurations actually measured.
 
 The suite covers all three formats, early/late routing weights, separate
 and in-kernel reduction, full and partial tiles, vector-load tails, masked
@@ -142,71 +157,75 @@ prequantized metadata and rejects unsupported scalars and unsafe geometry.
 The kernel boundary suite exercises one-CTA and two-CTA instructions,
 deeper K, mixed clusters, bulk TMA stages, token-back modes, and clamp.
 
-Run these additional acceptance experiments on the chosen supported node:
+### Additional coverage when the support claim needs it
 
-| Experiment | Procedure and evidence |
-|---|---|
-| Persistent state | Repeat the multirank changing-route test 100 times in fresh supervised jobs; also run 1,000 forward iterations in one session, alternating full, zero, and rank-skewed live counts |
-| Routing stress | Add uniform, single-expert hot spot (`top_k=1`), rank-local, cross-rank, and power-law routing; collect per-expert loads and compare every output on small geometries |
-| Negative routing | Separate processes for duplicate IDs, IDs below `-1`, IDs `>= E`, int64 values that truncate to valid int32, and NaN/Inf scores; require failure before unsafe dispatch |
-| Subgroup ownership | Two disjoint EP groups with non-global rank zero; initialize one per worker process, compare to a full-bank reference; confirm mismatched preinitialized NVSHMEM is rejected |
-| Graph replay | Change activations, scores, and masks for at least 100 replays; compare both layers' owned outputs, and serialize eager work on a second stream with events |
-| Capacity profiles | On every rank create `layer.create_workspace()` handles for capacities 1, 129, and 4096; warm up and capture each, alternate handles and default forward calls, compare owned/view outputs, then destroy one handle and reuse the others; confirm weights are transformed once and an unwarmed profile rejects capture |
-| Lifecycle | Repeated create/warmup/destroy, opposite layer-release order, pool eviction, and retry after a rejected captured destroy; check symmetric heap and CUDA allocation growth |
-| Failure handling | Fail one rank before compile and during allocation; enforce job timeout/termination and verify no winner is persisted; retry in a fresh job |
-| Compiler/package | Build and install a wheel in a clean environment; run strict single and multirank suites with `--installed-package`, which removes the source checkout from import resolution and records the imported package path |
+The existing suite already exercises changing routes, idle ranks, pooling,
+graph rebinding, and workspace lifecycle. Longer stress loops, disjoint EP
+subgroups, injected worker failures, additional capacity profiles, and new
+routing distributions are separate coverage extensions. Select them to address
+an identified code change or deployment requirement; no extra fixed-count
+stress campaign is required before reviewing the completed EP4 contribution.
+
+Clean installed-wheel native testing remains unmeasured for the refreshed drop.
+The strict runner's `--installed-package` option removes the source checkout
+from import resolution and records the imported package path. Use it when
+validating the release artifact; keep that result distinct from source-tree
+qualification.
 
 Do not continue a tuning or benchmark job after a CUDA failure. The job
 supervisor must terminate all ranks; collective free/finalize is unsafe
 when a peer is stuck or its CUDA context has failed.
 
-## Sanitizers
+## Sanitizer recipes
 
-Start with routing tails, then the supported knob variants. Run the
-multirank graph case under memcheck as well. Preserve raw reports; review
-any NVSHMEM or synchronization-related diagnostic instead of converting
-it into a skip.
+Native sanitizer coverage has not been collected for the refreshed export.
+These commands are available for targeted investigation or a maintainer-requested
+merge check; they are not part of the completed perf campaign. Start with routing
+tails or the affected graph/knob case. Preserve raw reports and review NVSHMEM or
+synchronization diagnostics instead of converting them into skips.
+Set `FI_RESULTS` to a fresh persistent directory first.
 
 ```bash
 python tests/moe_ep/qualify_sm107.py --suite single --filter router_vector_tails \
-  --sanitizer-tool memcheck --output-dir /tmp/sm107-memcheck
+  --sanitizer-tool memcheck --output-dir "$FI_RESULTS/memcheck"
 python tests/moe_ep/qualify_sm107.py --suite single --sanitizer-tool initcheck \
-  --output-dir /tmp/sm107-initcheck
+  --output-dir "$FI_RESULTS/initcheck"
 python tests/moe_ep/qualify_sm107.py --suite single --sanitizer-tool racecheck \
-  --output-dir /tmp/sm107-racecheck
+  --output-dir "$FI_RESULTS/racecheck"
 python tests/moe_ep/qualify_sm107.py --suite single --sanitizer-tool synccheck \
-  --output-dir /tmp/sm107-synccheck
-python tests/moe_ep/qualify_sm107.py --suite multi --world-size 2 \
-  --filter pooled_layers_graph --sanitizer-tool memcheck --output-dir /tmp/sm107-ep2-memcheck
+  --output-dir "$FI_RESULTS/synccheck"
+python tests/moe_ep/qualify_sm107.py --suite multi --world-size 4 \
+  --filter pooled_layers_graph --sanitizer-tool memcheck --output-dir "$FI_RESULTS/ep4-memcheck"
 ```
 
-## Performance and upstream acceptance
+## Performance and PR review
 
-Follow the [tuning and benchmark procedure](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md).
-Measure default and tuned configurations on the same hardware and software.
-Keep absolute latency and memory numbers, all per-rank samples, routing
-seeds/load statistics, preprocessing cost, eager/graph mode, and the exact
-timed span. The selected profiles reported by the original PR are candidate
-inputs, not performance evidence for the rebased implementation.
+The agreed campaign is complete. Its [result tables](moe_ep_sm107_results.md)
+and [measurement procedure](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+cover both geometries and reduction variants: compute/eager with L2 flushing
+for historical table comparisons, and kernel/forward × eager/graph without
+flushing. All use 20 warmups, 50 samples, and three process repetitions.
+`p50_rank0_us` matches the historical table statistic; `max_rank_p50_us` is
+the maximum of per-rank medians. Historical Blackwell measurements are reference
+data, not Rubin acceptance thresholds or evidence of an isolated hardware gain.
 
-Before merging, the reviewer should have:
+Before marking the PR ready for review:
 
-- A clean branch based on current main, with the mechanical port separate
-  from functional fixes and original authorship/provenance retained.
-- Passing pre-commit checks and SM100 BF16/MXFP8/NVFP4 regressions covering
-  the relocated code; SM90/SM120 registration and import checks as well.
-- A wheel-content/import check for all moved and new packages.
-- Native Rubin correctness, sanitizer, lifecycle, graph, and distributed
-  logs with no hidden skips or missing claimed configurations.
-- Same-node benchmark results for default/tuned kernel and full-forward
-  paths, with matched timing/cache/synchronization protocols and fixed-seed
-  repetitions. Preserve both maximum-rank and rank-zero statistics with
-  distinct labels, and agree performance/regression thresholds with maintainers.
-- A CI owner and provisioned runner. The manual
-  `.github/workflows/moe-ep-sm107.yml` workflow accepts existing runner labels;
-  wire the strict suite into the required PR/nightly matrix once that runner
-  and its pinned environment exist. The ordinary `run_tests.sh all` remains
-  the Blackwell suite; it does not qualify Rubin.
+- Reconcile the branch with current main, preserving original authorship and
+  vendor provenance. Check code affected by conflict resolutions and report
+  which measured source revision the attached results cover.
+- Run the required pre-commit checks on the resulting branch. Verify package
+  contents/import paths if the reconciliation changes packaging or relocations.
+- Attach the completed native correctness and performance evidence with its
+  exact scope, software stack, raw-data location, and unmeasured configurations.
+
+There is no additional Blackwell compatibility run, tuned-profile search,
+EP2/EP8 campaign, or benchmark-only smoke in the agreed pre-PR scope. Any
+validation needed after code changes should follow the actual affected paths.
+The manual `.github/workflows/moe-ep-sm107.yml` workflow accepts existing runner
+labels; assigning a CI owner and a provisioned native runner remains a maintainer
+integration task. `run_tests.sh all` remains the Blackwell suite and does not
+qualify Rubin.
 
 vLLM/SGLang integration and whole-model serving benchmarks are follow-up
 deployment qualification for this inference-kernel contribution. They are
